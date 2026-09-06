@@ -39,7 +39,9 @@ Accept a ready issue from a worker-approved GitHub repository. Resolve the issue
 
 Use a direct CLI wrapper and a Machinist stdin adapter around the same workflow function. An input adapter must not create a second implementation of delivery logic. Other trackers can be added later behind the same task contract.
 
-Worker configuration controls allowed repositories, executor commands, credentials, resource limits, and concurrency. Issue text and review feedback are untrusted task data. They cannot change those permissions or authorize merge, release, or unrelated repository work.
+Worker configuration selects registered repositories and executor commands. The control plane can cap active jobs when configured, and the runner applies process deadlines. These settings do not isolate credentials or filesystem access: the shipped Codex and Claude executors have full host access. Repository registration controls admission, not everything an admitted process can reach.
+
+Define and verify the execution boundary before M2. Use an isolated disposable environment with only the intended checkout and scoped test credentials. M1 must specify filesystem, credential, network, and resource restrictions, including how prohibited GitHub operations are denied; M2 proves those deployment controls. Issue text and review feedback remain untrusted task data. Instructions to ignore injected commands support the workflow, but do not enforce permissions that the process already holds.
 
 ### Code owns the lifecycle
 
@@ -94,9 +96,11 @@ Labels can advertise readiness or request intake. They are not a lock, proof of 
 
 Inventory the existing examples against the lifecycle. Choose one canonical implementation and preserve useful mechanics from the others. Specify phase results, PR/head identity, configured checks, authority, deadlines, and the distinction between a repair and an infrastructure retry. Convert these decisions into a small technical design before writing the replacement workflow. Retain old examples with explicit experimental or migration status until their replacement is exercised.
 
+Include the isolated deployment and access controls required for M2 in that design. Assign each restriction to an actual deployment, credential, or repository control and define a test that would expose its absence. Identify required capabilities the current runtime does not provide. A prompt or repository mapping alone cannot satisfy an access restriction.
+
 **Done when:** every stage has an owner and stopping rule; the workflow has no dependency on skill routing; a sample issue can be traced to evidence and final status without conflicting loops.
 
-**Check:** independent architecture review and executable fixtures for success, a code defect, a correct change, a false review finding, missing CI, timeout, and missing authority. Fixtures are baseline tests, not claims of live reliability.
+**Check:** independent architecture review and executable fixtures for success, a code defect, a correct change, a false review finding, missing CI, timeout, and missing authority. Review the deployment controls and their failure tests before authorizing the live trial. Fixtures are baseline tests, not claims of live reliability.
 
 **Dependencies:** the agreed lifecycle. Schema details are settled here before M2 implementation.
 
@@ -106,13 +110,15 @@ Inventory the existing examples against the lifecycle. Choose one canonical impl
 
 M2 through M4 require a dedicated single-worker deployment: one control plane, exactly one worker instance, and one active workflow invocation. Run direct and managed trials separately. The current runtime already requeues expired 30-second leases for any matching worker, so limiting the number of tickets does not prevent cross-worker duplication. Do not use an existing multi-worker deployment for these milestones. Before retrying or resuming, confirm the previous worker and its child processes have stopped; otherwise remain blocked. Automatic failover and adding another worker require M5's ownership protections first.
 
+Provision and verify M1's isolated environment before executing an agent on issue or review text. Keep host checkouts and production credentials unavailable to it. If a required access restriction cannot be demonstrated, stop the trial until the deployment provides it. This work belongs to the deployment setup; the roadmap does not claim that today's worker configuration supplies isolation.
+
 Implement the canonical workflow with a stdin adapter, explicit maker/checker calls, bounded CI waiting, and feedback classification. Choose a tested local harness adapter first. Record workflow/prompt versions, executor version, PR/head identity, verification evidence, elapsed time, and reported usage. Keep stdout machine-readable and progress logs human-readable; retain full machine feedback as bounded-access artifacts rather than an endless terminal transcript.
 
 **Done when:** a ready issue produces one PR with applicable evidence; a seeded defect is fixed and rechecked; optional or self-authored feedback does not create endless repair passes; a missing decision stops without inventing requirements. No merge occurs.
 
-**Check:** unit tests of state transitions and a live run in an explicitly disposable repository. Verify the dedicated deployment has one worker and no overlapping direct invocation. Exercise at least one full repair cycle. Verify terminal logs, result artifacts, process cancellation, and token reporting. Compare the final behavior with the issue's criteria rather than trusting the agent summary.
+**Check:** unit tests of state transitions and a live run in an explicitly disposable repository. Verify the dedicated deployment has one worker and no overlapping direct invocation. Use non-sensitive fixtures to prove the configured access restrictions, including rejection of unauthorized GitHub operations and unavailable host files and credentials. Exercise at least one full repair cycle. Verify terminal logs, result artifacts, process cancellation, and token reporting. Compare the final behavior with the issue's criteria rather than trusting the agent summary.
 
-**Dependencies:** M1 and the single-worker deployment restriction above.
+**Dependencies:** M1, its verified isolation controls, and the single-worker deployment restriction above.
 
 ### M3. Resume interrupted work on the same worker
 
