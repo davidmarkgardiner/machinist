@@ -21,6 +21,8 @@ import (
 type Worker struct {
 	config         config.Worker
 	instanceID     string
+	fleetRelease   string
+	releaseState   string
 	client         *Client
 	stdout         io.Writer
 	stderr         io.Writer
@@ -45,12 +47,15 @@ func New(workerConfig config.Worker, stdout, stderr io.Writer) (*Worker, error) 
 	if err != nil {
 		return nil, err
 	}
+	fleetRelease, releaseState := workerConfig.FleetRelease()
 	return &Worker{
-		config:     workerConfig,
-		instanceID: instanceID,
-		client:     client,
-		stdout:     stdout,
-		stderr:     stderr,
+		config:       workerConfig,
+		instanceID:   instanceID,
+		fleetRelease: fleetRelease,
+		releaseState: releaseState,
+		client:       client,
+		stdout:       stdout,
+		stderr:       stderr,
 	}, nil
 }
 
@@ -127,16 +132,15 @@ func withHeartbeats[T any](ctx context.Context, w *Worker, spec protocol.RunSpec
 }
 
 func (w *Worker) poll(ctx context.Context) (*protocol.RunSpec, error) {
-	fleetRelease, releaseState := w.config.FleetRelease()
-	acceptingWork := w.config.AcceptingWork() && releaseState != "error"
+	acceptingWork := w.config.AcceptingWork() && w.releaseState != "error"
 	request := protocol.PollRequest{
 		InstanceID:    w.instanceID,
 		Name:          w.config.Name,
 		Executors:     w.config.ExecutorNames(),
 		Repositories:  w.config.RepositoryNames(),
 		Models:        w.config.ModelCapabilities(),
-		FleetRelease:  fleetRelease,
-		ReleaseState:  releaseState,
+		FleetRelease:  w.fleetRelease,
+		ReleaseState:  w.releaseState,
 		AcceptingWork: &acceptingWork,
 	}
 	var response protocol.PollResponse

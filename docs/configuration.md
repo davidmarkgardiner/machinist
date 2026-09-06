@@ -56,6 +56,10 @@ fleet_release_file = "~/.machinist/current-release/release"
 drain_file = "~/.machinist/drain"
 ```
 
+The worker reads its release marker once at process startup, so changing the marker or
+switching the release symlink does not claim that already-running code has changed.
+Restart the worker to advertise the new release. The drain marker remains dynamic.
+
 When a release policy is active, a missing, unreadable, invalid, or unaccepted release
 remains visible in worker status but receives no new lease. A present drain file has the
 same admission effect. An existing valid lease continues to be returned to its worker so

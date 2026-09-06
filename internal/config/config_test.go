@@ -163,6 +163,10 @@ func TestFleetReleasePolicyValidation(t *testing.T) {
 	if _, err := (Server{FleetReleasePolicyFile: path}).FleetReleasePolicy(); err == nil || !strings.Contains(err.Error(), "require a required") {
 		t.Fatalf("disabled policy with accepted releases error = %v", err)
 	}
+	writeTestFile(t, path, `{"require":"`+required+`","accepted":["`+required+`"]}`)
+	if _, err := (Server{FleetReleasePolicyFile: path}).FleetReleasePolicy(); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("unknown policy field error = %v", err)
+	}
 }
 
 func TestLoadConfigCombinesServerAndCommands(t *testing.T) {

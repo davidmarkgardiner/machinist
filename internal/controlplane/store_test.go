@@ -691,6 +691,33 @@ func TestAvailableRepositoriesIncludesWorkerWithRunningExecution(t *testing.T) {
 	}
 }
 
+func TestAvailableRepositoriesExcludesDrainingWorkerWithRunningExecution(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
+	if _, err := store.CreateJob(t.Context(), "request", "machinist", "plan", testAgent("plan", "Plan request")); err != nil {
+		t.Fatal(err)
+	}
+	request := pollRequest("worker-draining", []string{"codex"}, []string{"machinist"})
+	run, err := store.Poll(t.Context(), request)
+	if err != nil || run == nil {
+		t.Fatalf("poll = %#v, %v", run, err)
+	}
+	accepting := false
+	request.AcceptingWork = &accepting
+	if _, err := store.Poll(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `UPDATE workers SET last_seen_at=? WHERE instance_id='worker-draining'`, time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := store.AvailableRepositories(t.Context(), time.Now().Add(-time.Minute), config.FleetReleasePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repositories) != 0 {
+		t.Fatalf("repositories = %#v, want none", repositories)
+	}
+}
+
 func TestAvailableRepositoriesExcludesIncompatibleAndDrainingIdleWorkers(t *testing.T) {
 	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
 	current := strings.Repeat("b", 40)

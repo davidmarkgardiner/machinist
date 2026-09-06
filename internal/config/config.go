@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -388,7 +389,15 @@ func (s Server) FleetReleasePolicy() (FleetReleasePolicy, error) {
 		return FleetReleasePolicy{}, fmt.Errorf("read fleet release policy: %w", err)
 	}
 	var policy FleetReleasePolicy
-	if err := json.Unmarshal(body, &policy); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&policy); err != nil {
+		return FleetReleasePolicy{}, fmt.Errorf("parse fleet release policy: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
 		return FleetReleasePolicy{}, fmt.Errorf("parse fleet release policy: %w", err)
 	}
 	if strings.TrimSpace(policy.Required) == "" {

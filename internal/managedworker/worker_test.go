@@ -296,9 +296,14 @@ func TestManagedWorkerPollsAgainAfterCompletionConflict(t *testing.T) {
 func TestManagedWorkerPollReportsFleetReleaseAndDrainState(t *testing.T) {
 	directory := t.TempDir()
 	release := strings.Repeat("a", 40)
+	replacementRelease := strings.Repeat("b", 40)
 	releasePath := filepath.Join(directory, "release")
 	drainPath := filepath.Join(directory, "drain")
+	tokenPath := filepath.Join(directory, "token")
 	if err := os.WriteFile(releasePath, []byte(release+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenPath, []byte("secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(drainPath, []byte("updating\n"), 0o600); err != nil {
@@ -314,13 +319,20 @@ func TestManagedWorkerPollReportsFleetReleaseAndDrainState(t *testing.T) {
 		_ = json.NewEncoder(response).Encode(protocol.PollResponse{})
 	}))
 	defer server.Close()
-	worker := &Worker{
-		config: config.Worker{
-			Name: "worker-test", FleetReleaseFile: releasePath, DrainFile: drainPath,
-			ControlPlane: config.ControlPlane{URL: server.URL},
-		},
-		instanceID: "worker-test",
-		client:     newClient(server.URL, "secret", server.Client()),
+	worker, err := New(config.Worker{
+		Name:             "worker-test",
+		DataDirectory:    filepath.Join(directory, "worker-data"),
+		FleetReleaseFile: releasePath,
+		DrainFile:        drainPath,
+		ControlPlane:     config.ControlPlane{URL: server.URL, TokenFile: tokenPath},
+		Executors:        map[string]config.Executor{"test": {Command: []string{"agent"}}},
+		Repositories:     map[string]config.Repository{"machinist": {Path: directory}},
+	}, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(releasePath, []byte(replacementRelease+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if run, err := worker.poll(t.Context()); err != nil || run != nil {
 		t.Fatalf("poll = %#v, %v", run, err)

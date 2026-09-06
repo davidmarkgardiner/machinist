@@ -1061,8 +1061,7 @@ func (s *Store) TriggerSnapshot(ctx context.Context) ([]TriggerStatus, error) {
 }
 
 func (s *Store) AvailableRepositories(ctx context.Context, seenAfter time.Time, releasePolicy config.FleetReleasePolicy) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT wr.repository,w.fleet_release,w.release_state,w.accepting_work,
-EXISTS (SELECT 1 FROM runs r WHERE r.worker_instance=w.instance_id AND r.state='running')
+	rows, err := s.db.QueryContext(ctx, `SELECT wr.repository,w.fleet_release,w.release_state,w.accepting_work
 FROM worker_repositories wr
 JOIN workers w ON w.instance_id=wr.worker_instance
 WHERE julianday(w.last_seen_at) >= julianday(?) OR EXISTS (SELECT 1 FROM runs r WHERE r.worker_instance=w.instance_id AND r.state='running')
@@ -1074,11 +1073,11 @@ ORDER BY wr.repository`, seenAfter.UTC().Format(time.RFC3339Nano))
 	repositorySet := map[string]bool{}
 	for rows.Next() {
 		var repository, fleetRelease, releaseState string
-		var acceptingWork, hasRunning bool
-		if err := rows.Scan(&repository, &fleetRelease, &releaseState, &acceptingWork, &hasRunning); err != nil {
+		var acceptingWork bool
+		if err := rows.Scan(&repository, &fleetRelease, &releaseState, &acceptingWork); err != nil {
 			return nil, err
 		}
-		if hasRunning || (acceptingWork && releaseState != "error" && releasePolicy.Allows(fleetRelease)) {
+		if acceptingWork && releaseState != "error" && releasePolicy.Allows(fleetRelease) {
 			repositorySet[repository] = true
 		}
 	}
