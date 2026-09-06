@@ -32,7 +32,8 @@ class AgentTests(unittest.TestCase):
         poll = patch.object(agent, "wait_for_ci", return_value={"ci_status": "passed"})
         self.poll = poll.start()
         self.addCleanup(poll.stop)
-        stderr = contextlib.redirect_stderr(io.StringIO())
+        self.progress = io.StringIO()
+        stderr = contextlib.redirect_stderr(self.progress)
         stderr.__enter__()
         self.addCleanup(stderr.__exit__, None, None, None)
 
@@ -94,6 +95,8 @@ class AgentTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(agent.main([url]), 0)
         self.assertEqual(json.loads(output.getvalue()), report)
+        self.assertIn("Starting AI agent to implement", self.progress.getvalue())
+        self.assertIn("Finished: completed", self.progress.getvalue())
         self.assertIn(url, run.call_args.args[0])
         self.assertNotIn("{task}", run.call_args.args[0])
 
@@ -279,7 +282,13 @@ class FeedbackTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result["ci_status"], "passed")
-        self.assertEqual(json.loads(self.output.getvalue()), result)
+        progress = self.output.getvalue()
+        self.assertIn("Waiting for feedback on owner/repo#467", progress)
+        self.assertIn("Checks still running; checking again in 2s", progress)
+        self.assertIn("Collecting code review feedback", progress)
+        self.assertIn("Feedback: CI passed", progress)
+        self.assertIn("fix this", progress)
+        self.assertIn("bot summary", progress)
         self.assertEqual(len(result["reviews"]), 2)
         self.assertEqual(result["review_comments"][0]["path"], "agent.py")
         self.assertEqual(result["comments"][0]["body"], "bot summary")
@@ -330,7 +339,8 @@ class IterationTests(unittest.TestCase):
         login = patch.object(agent, "gh", return_value={"login": "builder"})
         login.start()
         self.addCleanup(login.stop)
-        stderr = contextlib.redirect_stderr(io.StringIO())
+        self.progress = io.StringIO()
+        stderr = contextlib.redirect_stderr(self.progress)
         stderr.__enter__()
         self.addCleanup(stderr.__exit__, None, None, None)
 
@@ -364,6 +374,9 @@ class IterationTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertIn("Fix a bug", run.call_args.args[0])
         self.assertIn("PR #467", run.call_args.args[0])
+        self.assertIn(
+            "Starting AI agent to address feedback (pass 1/3", self.progress.getvalue()
+        )
         wait.assert_called_once_with("owner/repo", 467)
 
     def test_approved_and_dismissed_reviews_do_not_trigger_repairs(self):

@@ -90,17 +90,49 @@ def issue_url(value: str) -> str:
     return value
 
 
+def log(message: str) -> None:
+    """Flush progress to stderr so redirected stdout remains one JSON result."""
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
+
+
+def log_feedback(feedback: dict) -> None:
+    log(f"Feedback: CI {feedback['ci_status']} for PR #{feedback['pr_number']}")
+    for check in feedback["checks"]:
+        name = check.get("name", check.get("context", "check"))
+        state = check.get("conclusion") or check.get("status") or check.get("state")
+        log(f"  {name}: {state}")
+    count = 0
+    for kind in ("reviews", "review_comments", "comments"):
+        for item in feedback[kind]:
+            body = item.get("body") or item.get("state")
+            if not body:
+                continue
+            count += 1
+            author = (item.get("user") or {}).get("login", "unknown")
+            location = (
+                f" ({item['path']}:{item.get('line') or '?'})"
+                if item.get("path")
+                else ""
+            )
+            log(f"  {kind} by {author}{location}:\n    " + body.replace("\n", "\n    "))
+    if not count:
+        log("  No review feedback available.")
+
+
 def run_codex(prompt: str) -> dict:
     codex_bin = shutil.which("codex")
     if not codex_bin:
         raise RuntimeError("codex was not found on PATH; install the Codex CLI")
+    log(f"Using Codex: {codex_bin}")
     with Codex(CodexConfig(codex_bin=codex_bin)) as codex:
         thread = codex.thread_start(cwd=str(Path.cwd()), sandbox=Sandbox.full_access)
         result = thread.run(prompt, output_schema=RESULT_SCHEMA)
         if result.status != TurnStatus.completed:
             detail = result.error.message if result.error else result.status.value
             raise RuntimeError(f"coding agent did not complete: {detail}")
-        return json.loads(result.final_response or "")
+        report = json.loads(result.final_response or "")
+        log(f"AI agent {report['status']}: {report['summary']}")
+        return report
 
 
 def gh(*args: str):
@@ -112,6 +144,7 @@ def gh(*args: str):
 
 
 def implement(task: str) -> dict:
+    log(f"Starting AI agent to implement {task}")
     report = run_codex(PROMPT.format(task=task))
     if report["status"] == "completed" and report["pr_number"] is None:
         raise ValueError("agent reported completion without a PR number")
@@ -128,6 +161,7 @@ def wait_for_ci(
     """
     if timeout <= 0 or interval <= 0:
         raise ValueError("timeout and interval must be positive")
+    log(f"Waiting for feedback on {repo}#{pr_number} (up to {timeout:g}s).")
     deadline = time.monotonic() + timeout
 
     while True:
@@ -150,7 +184,10 @@ def wait_for_ci(
         remaining = deadline - time.monotonic()
         if finished or remaining <= 0:
             break
-        time.sleep(min(interval, remaining))
+        delay = min(interval, remaining)
+        status = "Checks still running" if checks else "No checks registered yet"
+        log(f"{status}; checking again in {delay:g}s.")
+        time.sleep(delay)
 
     passed = finished and all(
         c.get("conclusion", c.get("state")) in {"SUCCESS", "NEUTRAL", "SKIPPED"}
@@ -162,6 +199,7 @@ def wait_for_ci(
         "ci_status": "passed" if passed else "failed" if finished else "timed_out",
         "checks": checks,
     }
+    log("Collecting code review feedback...")
     # Review bodies and inline comments are separate GitHub endpoints. Include all
     # pages and retain commit IDs so earlier feedback is not mistaken for new review.
     for key, endpoint in {
@@ -174,7 +212,7 @@ def wait_for_ci(
     current = gh("pr", "view", str(pr_number), "--repo", repo, "--json", "headRefOid")
     if current["headRefOid"] != feedback["head_sha"]:
         raise RuntimeError("PR head changed while collecting feedback; run again")
-    print(json.dumps(feedback), file=sys.stderr)
+    log_feedback(feedback)
     return feedback
 
 
@@ -217,7 +255,9 @@ def iterate(task: str, repo: str, report: dict, feedback: dict) -> dict:
 
         if repair_author is None:
             repair_author = gh("api", "user")["login"]
-        print(f"Repair pass {attempt}/3 for PR #{pr_number}", file=sys.stderr)
+        log(
+            f"Starting AI agent to address feedback (pass {attempt}/3, PR #{pr_number})."
+        )
         repaired = run_codex(
             REPAIR_PROMPT.format(
                 task=task,
@@ -272,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
             "summary": str(error) or type(error).__name__,
         }
         exit_code = 1
+    log(f"Finished: {report['status']}. {report['summary']}")
     print(json.dumps(report))
     return exit_code
 
