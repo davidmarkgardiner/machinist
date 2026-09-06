@@ -35,25 +35,27 @@ const workerAvailabilityWindow = 15 * time.Second
 var webAssets embed.FS
 
 type Server struct {
-	store             *Store
-	definitionPath    string
-	triggers          []config.ResolvedTrigger
-	github            githubTriggerClient
-	schedulerEvery    time.Duration
-	now               func() time.Time
-	schedulerError    func(error)
-	shutdownTimeout   time.Duration
-	maxConcurrentJobs int
-	workerToken       string
-	csrfToken         string
-	handler           http.Handler
+	store              *Store
+	definitionPath     string
+	triggers           []config.ResolvedTrigger
+	github             githubTriggerClient
+	schedulerEvery     time.Duration
+	now                func() time.Time
+	schedulerError     func(error)
+	shutdownTimeout    time.Duration
+	maxConcurrentJobs  int
+	fleetReleasePolicy config.FleetReleasePolicy
+	workerToken        string
+	csrfToken          string
+	handler            http.Handler
 }
 
 type statusResponse struct {
 	Snapshot
-	Commands     []string `json:"commands"`
-	Repositories []string `json:"repositories"`
-	CSRFToken    string   `json:"csrf_token"`
+	Commands           []string                  `json:"commands"`
+	Repositories       []string                  `json:"repositories"`
+	FleetReleasePolicy config.FleetReleasePolicy `json:"fleet_release_policy"`
+	CSRFToken          string                    `json:"csrf_token"`
 }
 
 type submitRequest struct {
@@ -80,7 +82,7 @@ type catalogResponse struct {
 	Repositories []string `json:"repositories"`
 }
 
-func NewServer(store *Store, definitionPath, workerToken string, maxConcurrentJobs int) (*Server, error) {
+func NewServer(store *Store, definitionPath, workerToken string, maxConcurrentJobs int, fleetReleasePolicy config.FleetReleasePolicy) (*Server, error) {
 	if maxConcurrentJobs < 0 {
 		return nil, errors.New("max concurrent jobs cannot be negative")
 	}
@@ -108,7 +110,8 @@ func NewServer(store *Store, definitionPath, workerToken string, maxConcurrentJo
 		github: NewGitHubCLI("gh", 30*time.Second), now: time.Now,
 		schedulerEvery: 30 * time.Second, shutdownTimeout: 5 * time.Second,
 		schedulerError:    func(err error) { log.Printf("scheduler: %v", err) },
-		maxConcurrentJobs: maxConcurrentJobs, workerToken: workerToken, csrfToken: csrfToken,
+		maxConcurrentJobs: maxConcurrentJobs, fleetReleasePolicy: fleetReleasePolicy,
+		workerToken: workerToken, csrfToken: csrfToken,
 	}
 	server.handler, err = server.routes()
 	if err != nil {
@@ -299,17 +302,20 @@ func (s *Server) status(response http.ResponseWriter, request *http.Request) {
 	now := s.store.now().UTC()
 	for index := range snapshot.Workers {
 		snapshot.Workers[index].Connected = !snapshot.Workers[index].LastSeenAt.Before(now.Add(-workerAvailabilityWindow))
+		snapshot.Workers[index].ReleaseCompatible = snapshot.Workers[index].ReleaseState != "error" && s.fleetReleasePolicy.Allows(snapshot.Workers[index].FleetRelease)
+		snapshot.Workers[index].ReleaseCurrent = s.fleetReleasePolicy.Required == "" || snapshot.Workers[index].FleetRelease == s.fleetReleasePolicy.Required
 	}
-	repositories, repositoryErr := s.store.AvailableRepositories(request.Context(), now.Add(-workerAvailabilityWindow))
+	repositories, repositoryErr := s.store.AvailableRepositories(request.Context(), now.Add(-workerAvailabilityWindow), s.fleetReleasePolicy)
 	if repositoryErr != nil {
 		writeError(response, http.StatusInternalServerError, repositoryErr)
 		return
 	}
 	writeJSON(response, http.StatusOK, statusResponse{
-		Snapshot:     snapshot,
-		Commands:     definition.CommandNames(),
-		Repositories: repositories,
-		CSRFToken:    s.csrfToken,
+		Snapshot:           snapshot,
+		Commands:           definition.CommandNames(),
+		Repositories:       repositories,
+		FleetReleasePolicy: s.fleetReleasePolicy,
+		CSRFToken:          s.csrfToken,
 	})
 }
 
@@ -411,12 +417,34 @@ func (s *Server) poll(response http.ResponseWriter, request *http.Request) {
 		writeError(response, http.StatusBadRequest, errors.New("worker instance_id and name are required"))
 		return
 	}
-	run, err := s.store.poll(request.Context(), input, s.maxConcurrentJobs)
+	if err := validatePollRelease(input); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
+	run, err := s.store.poll(request.Context(), input, s.maxConcurrentJobs, s.fleetReleasePolicy)
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(response, http.StatusOK, protocol.PollResponse{Run: run})
+	writeJSON(response, http.StatusOK, protocol.PollResponse{Run: run, RequiredFleetRelease: s.fleetReleasePolicy.Required})
+}
+
+func validatePollRelease(input protocol.PollRequest) error {
+	switch input.ReleaseState {
+	case "", "unmanaged", "ready", "error":
+	default:
+		return errors.New("worker release_state is invalid")
+	}
+	if input.FleetRelease != "" && !config.ValidFleetRelease(input.FleetRelease) {
+		return errors.New("worker fleet_release must be a canonical 40- or 64-character hexadecimal commit ID")
+	}
+	if input.ReleaseState == "ready" && input.FleetRelease == "" {
+		return errors.New("worker fleet_release is required when release_state is ready")
+	}
+	if input.ReleaseState != "ready" && input.FleetRelease != "" {
+		return errors.New("worker fleet_release is only allowed when release_state is ready")
+	}
+	return nil
 }
 
 func (s *Server) complete(response http.ResponseWriter, request *http.Request) {

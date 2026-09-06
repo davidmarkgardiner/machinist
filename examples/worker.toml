@@ -1,6 +1,9 @@
 # Machine-local paths only. Commands and script workflows belong in config.toml.
 # name is optional and defaults to the machine hostname.
 data_directory = "~/.machinist/worker"
+# An atomic current-release symlink can expose both the shared skill and this marker.
+# fleet_release_file = "~/.machinist/current-release/release"
+# drain_file = "~/.machinist/drain"
 
 [control_plane]
 url = "http://127.0.0.1:7331"

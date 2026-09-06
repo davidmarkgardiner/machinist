@@ -58,7 +58,7 @@ func TestManagedWorkerExecutesControlPlaneRun(t *testing.T) {
 	if _, err := store.CreateJob(t.Context(), "managed request", "machinist", "plan", agent); err != nil {
 		t.Fatal(err)
 	}
-	server, err := controlplane.NewServer(store, definitionPath, "secret", 0)
+	server, err := controlplane.NewServer(store, definitionPath, "secret", 0, config.FleetReleasePolicy{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ timeout = "5s"
 	if _, err := store.CreateJob(t.Context(), "queued shepherd", "disposable", "shepherd", command); err != nil {
 		t.Fatal(err)
 	}
-	server, err := controlplane.NewServer(store, definitionPath, "secret", 0)
+	server, err := controlplane.NewServer(store, definitionPath, "secret", 0, config.FleetReleasePolicy{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,6 +290,44 @@ func TestManagedWorkerPollsAgainAfterCompletionConflict(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "machinist: report run run-test: control plane returned HTTP 409 Conflict") {
 		t.Fatalf("completion conflict was not logged: %q", stderr.String())
+	}
+}
+
+func TestManagedWorkerPollReportsFleetReleaseAndDrainState(t *testing.T) {
+	directory := t.TempDir()
+	release := strings.Repeat("a", 40)
+	releasePath := filepath.Join(directory, "release")
+	drainPath := filepath.Join(directory, "drain")
+	if err := os.WriteFile(releasePath, []byte(release+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(drainPath, []byte("updating\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan protocol.PollRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var poll protocol.PollRequest
+		if err := json.NewDecoder(request.Body).Decode(&poll); err != nil {
+			t.Errorf("decode poll: %v", err)
+		}
+		received <- poll
+		_ = json.NewEncoder(response).Encode(protocol.PollResponse{})
+	}))
+	defer server.Close()
+	worker := &Worker{
+		config: config.Worker{
+			Name: "worker-test", FleetReleaseFile: releasePath, DrainFile: drainPath,
+			ControlPlane: config.ControlPlane{URL: server.URL},
+		},
+		instanceID: "worker-test",
+		client:     newClient(server.URL, "secret", server.Client()),
+	}
+	if run, err := worker.poll(t.Context()); err != nil || run != nil {
+		t.Fatalf("poll = %#v, %v", run, err)
+	}
+	poll := <-received
+	if poll.FleetRelease != release || poll.ReleaseState != "ready" || poll.AcceptingWork == nil || *poll.AcceptingWork {
+		t.Fatalf("poll request = %#v", poll)
 	}
 }
 

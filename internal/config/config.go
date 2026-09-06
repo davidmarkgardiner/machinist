@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -32,13 +33,17 @@ const (
 	legacyFactoryPrefix      = "{{factory."
 )
 
+var fleetReleasePattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+
 type Worker struct {
-	Name          string                `toml:"name"`
-	DataDirectory string                `toml:"data_directory"`
-	ControlPlane  ControlPlane          `toml:"control_plane"`
-	Executors     map[string]Executor   `toml:"executors"`
-	Repositories  map[string]Repository `toml:"repositories"`
-	configDir     string
+	Name             string                `toml:"name"`
+	DataDirectory    string                `toml:"data_directory"`
+	FleetReleaseFile string                `toml:"fleet_release_file"`
+	DrainFile        string                `toml:"drain_file"`
+	ControlPlane     ControlPlane          `toml:"control_plane"`
+	Executors        map[string]Executor   `toml:"executors"`
+	Repositories     map[string]Repository `toml:"repositories"`
+	configDir        string
 }
 
 type ControlPlane struct {
@@ -60,11 +65,28 @@ type Repository struct {
 }
 
 type Server struct {
-	Listen            string `toml:"listen"`
-	Database          string `toml:"database"`
-	WorkerTokenFile   string `toml:"worker_token_file"`
-	MaxConcurrentJobs *int   `toml:"max_concurrent_jobs"`
-	configDir         string
+	Listen                 string `toml:"listen"`
+	Database               string `toml:"database"`
+	WorkerTokenFile        string `toml:"worker_token_file"`
+	FleetReleasePolicyFile string `toml:"fleet_release_policy_file"`
+	MaxConcurrentJobs      *int   `toml:"max_concurrent_jobs"`
+	configDir              string
+}
+
+type FleetReleasePolicy struct {
+	Required string   `json:"required"`
+	Accepted []string `json:"accepted"`
+}
+
+func ValidFleetRelease(release string) bool {
+	return fleetReleasePattern.MatchString(release)
+}
+
+func (p FleetReleasePolicy) Allows(release string) bool {
+	if p.Required == "" {
+		return true
+	}
+	return slices.Contains(p.Accepted, release)
 }
 
 type Config struct {
@@ -307,6 +329,31 @@ func (w Worker) WorkerToken() (string, error) {
 	return readToken(path)
 }
 
+// FleetRelease returns the worker's installed immutable fleet release and a
+// non-secret state suitable for the control-plane status API.
+func (w Worker) FleetRelease() (string, string) {
+	if w.FleetReleaseFile == "" {
+		return "", "unmanaged"
+	}
+	body, err := readBoundedFile(w.FleetReleaseFile, 256)
+	if err != nil {
+		return "", "error"
+	}
+	release, err := normalizeFleetRelease(string(body))
+	if err != nil {
+		return "", "error"
+	}
+	return release, "ready"
+}
+
+func (w Worker) AcceptingWork() bool {
+	if w.DrainFile == "" {
+		return true
+	}
+	_, err := os.Stat(w.DrainFile)
+	return errors.Is(err, os.ErrNotExist)
+}
+
 func (w Worker) ExecutorNames() []string { return sortedMapKeys(w.Executors) }
 
 func (w Worker) ModelCapabilities() map[string][]string {
@@ -330,6 +377,58 @@ func (s Server) ConcurrentJobLimit() int {
 		return 0
 	}
 	return *s.MaxConcurrentJobs
+}
+
+func (s Server) FleetReleasePolicy() (FleetReleasePolicy, error) {
+	if s.FleetReleasePolicyFile == "" {
+		return FleetReleasePolicy{}, nil
+	}
+	body, err := readBoundedFile(s.FleetReleasePolicyFile, maxConfigBytes)
+	if err != nil {
+		return FleetReleasePolicy{}, fmt.Errorf("read fleet release policy: %w", err)
+	}
+	var policy FleetReleasePolicy
+	if err := json.Unmarshal(body, &policy); err != nil {
+		return FleetReleasePolicy{}, fmt.Errorf("parse fleet release policy: %w", err)
+	}
+	if strings.TrimSpace(policy.Required) == "" {
+		if len(policy.Accepted) != 0 {
+			return FleetReleasePolicy{}, errors.New("accepted fleet releases require a required release")
+		}
+		return FleetReleasePolicy{}, nil
+	}
+	policy.Required, err = normalizeFleetRelease(policy.Required)
+	if err != nil {
+		return FleetReleasePolicy{}, fmt.Errorf("required fleet release: %w", err)
+	}
+	if len(policy.Accepted) == 0 {
+		policy.Accepted = []string{policy.Required}
+	}
+	seen := make(map[string]bool, len(policy.Accepted))
+	accepted := make([]string, 0, len(policy.Accepted))
+	for _, value := range policy.Accepted {
+		release, normalizeErr := normalizeFleetRelease(value)
+		if normalizeErr != nil {
+			return FleetReleasePolicy{}, fmt.Errorf("accepted fleet release: %w", normalizeErr)
+		}
+		if !seen[release] {
+			seen[release] = true
+			accepted = append(accepted, release)
+		}
+	}
+	if !seen[policy.Required] {
+		return FleetReleasePolicy{}, errors.New("required fleet release must be accepted")
+	}
+	policy.Accepted = accepted
+	return policy, nil
+}
+
+func normalizeFleetRelease(value string) (string, error) {
+	release := strings.ToLower(strings.TrimSpace(value))
+	if !fleetReleasePattern.MatchString(release) {
+		return "", errors.New("must be a 40- or 64-character hexadecimal commit ID")
+	}
+	return release, nil
 }
 
 func LoadCommand(definitionPath, name string) (ResolvedCommand, error) {
@@ -489,6 +588,20 @@ func applyWorkerDefaultsWithHostname(worker Worker, getHostname func() (string, 
 		return Worker{}, fmt.Errorf("resolve worker data directory: %w", err)
 	}
 	worker.DataDirectory = filepath.Clean(worker.DataDirectory)
+	for label, configured := range map[string]*string{
+		"fleet release file": &worker.FleetReleaseFile,
+		"drain file":         &worker.DrainFile,
+	} {
+		if strings.TrimSpace(*configured) == "" {
+			*configured = ""
+			continue
+		}
+		resolved, resolveErr := resolveConfigPath(*configured, worker.configDir)
+		if resolveErr != nil {
+			return Worker{}, fmt.Errorf("resolve %s: %w", label, resolveErr)
+		}
+		*configured = resolved
+	}
 	for name, repository := range worker.Repositories {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(repository.Path) == "" {
 			return Worker{}, errors.New("repository names and paths must be non-empty")
@@ -544,6 +657,12 @@ func applyServerDefaults(server Server) (Server, error) {
 		return Server{}, fmt.Errorf("resolve worker token file: %w", err)
 	}
 	server.WorkerTokenFile = tokenPath
+	if strings.TrimSpace(server.FleetReleasePolicyFile) != "" {
+		server.FleetReleasePolicyFile, err = resolveConfigPath(server.FleetReleasePolicyFile, server.configDir)
+		if err != nil {
+			return Server{}, fmt.Errorf("resolve fleet release policy file: %w", err)
+		}
+	}
 	return server, nil
 }
 

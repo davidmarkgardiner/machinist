@@ -183,6 +183,53 @@ func TestServerAppliesConcurrentJobLimitToWorkerPolls(t *testing.T) {
 	}
 }
 
+func TestServerReportsAndEnforcesFleetReleasePolicy(t *testing.T) {
+	server, webServer := newTestHTTPServer(t)
+	defer webServer.Close()
+	required := strings.Repeat("b", 40)
+	server.fleetReleasePolicy = config.FleetReleasePolicy{Required: required, Accepted: []string{required}}
+	if _, err := server.store.CreateJob(t.Context(), "request", "machinist", "plan", config.ResolvedCommand{Name: "plan", Executor: "test", Prompt: "request", Timeout: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	accepting := true
+	response := postJSON(t, webServer.URL+"/api/v1/workers/poll", protocol.PollRequest{
+		InstanceID: "worker-a", Name: "worker-a", Executors: []string{"test"}, Repositories: []string{"machinist"},
+		FleetRelease: strings.Repeat("a", 40), ReleaseState: "ready", AcceptingWork: &accepting,
+	}, map[string]string{"Authorization": "Bearer secret"})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("poll status = %d", response.StatusCode)
+	}
+	var poll protocol.PollResponse
+	if err := json.NewDecoder(response.Body).Decode(&poll); err != nil {
+		t.Fatal(err)
+	}
+	if poll.Run != nil || poll.RequiredFleetRelease != required {
+		t.Fatalf("poll response = %#v", poll)
+	}
+	status := getStatus(t, webServer.URL)
+	if status.FleetReleasePolicy.Required != required || len(status.Workers) != 1 || status.Workers[0].ReleaseCompatible || status.Workers[0].ReleaseCurrent {
+		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestServerRejectsInvalidFleetReleaseReports(t *testing.T) {
+	_, webServer := newTestHTTPServer(t)
+	defer webServer.Close()
+	for _, request := range []protocol.PollRequest{
+		{InstanceID: "worker-a", Name: "worker-a", ReleaseState: "mystery"},
+		{InstanceID: "worker-a", Name: "worker-a", ReleaseState: "ready"},
+		{InstanceID: "worker-a", Name: "worker-a", ReleaseState: "unmanaged", FleetRelease: strings.Repeat("a", 40)},
+	} {
+		response := postJSON(t, webServer.URL+"/api/v1/workers/poll", request, map[string]string{"Authorization": "Bearer secret"})
+		if response.StatusCode != http.StatusBadRequest {
+			response.Body.Close()
+			t.Fatalf("poll %#v status = %d", request, response.StatusCode)
+		}
+		response.Body.Close()
+	}
+}
+
 func TestServerAcceptsBearerSubmissionAndRejectsInvalidToken(t *testing.T) {
 	_, webServer := newTestHTTPServer(t)
 	defer webServer.Close()
@@ -689,7 +736,7 @@ func TestServerCancellationAlwaysStopsHTTPServer(t *testing.T) {
 			t.Fatal(err)
 		}
 		store := openTestStore(t, filepath.Join(directory, "machinist.db"))
-		server, err := NewServer(store, definitionPath, "secret", 0)
+		server, err := NewServer(store, definitionPath, "secret", 0, config.FleetReleasePolicy{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -804,7 +851,7 @@ func newTestHTTPServerWithLimit(t *testing.T, maxConcurrentJobs int) (*Server, *
 		t.Fatal(err)
 	}
 	store := openTestStore(t, filepath.Join(directory, "machinist.db"))
-	server, err := NewServer(store, definitionPath, "secret", maxConcurrentJobs)
+	server, err := NewServer(store, definitionPath, "secret", maxConcurrentJobs, config.FleetReleasePolicy{})
 	if err != nil {
 		t.Fatal(err)
 	}

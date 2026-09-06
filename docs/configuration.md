@@ -27,6 +27,49 @@ path = "/absolute/path/to/my-project"
 Managed triggers select one command with `command = "audit"`. Model selection remains
 available when the executor command includes `{{machinist.model}}`.
 
+## Governed fleet releases
+
+A control plane can require workers to advertise a compatible immutable fleet release:
+
+```toml
+[server]
+fleet_release_policy_file = "~/.machinist/server/fleet-release-policy.json"
+```
+
+The policy is deliberately outside the fleet repository, so rollout automation can move
+through a dual-release canary window without changing the release being deployed:
+
+```json
+{
+  "required": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "accepted": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ]
+}
+```
+
+Workers report the release through two machine-local files:
+
+```toml
+fleet_release_file = "~/.machinist/current-release/release"
+drain_file = "~/.machinist/drain"
+```
+
+When a release policy is active, a missing, unreadable, invalid, or unaccepted release
+remains visible in worker status but receives no new lease. A present drain file has the
+same admission effect. An existing valid lease continues to be returned to its worker so
+an update never abandons work already in progress. Rollout tools should first create the
+drain file and wait for status to show `accepting_work: false` with no active run; they can
+then atomically switch `current-release`, restart the worker, and remove the drain file.
+During a canary, keep both old and new releases in `accepted`; after every worker reports
+the required release, narrow `accepted` to that release alone.
+
+To disable admission gating while retaining the configured policy path, use
+`{"required":"","accepted":[]}` and restart the control plane. Malformed policy JSON or
+an accepted list that does not contain its required release fails startup rather than
+silently admitting an unknown worker release.
+
 ## Migration
 
 The `agents` table was renamed to `commands`. Move `[agents.NAME]` to `[commands.NAME]`
