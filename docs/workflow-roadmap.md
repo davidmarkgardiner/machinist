@@ -104,13 +104,15 @@ Inventory the existing examples against the lifecycle. Choose one canonical impl
 
 **Result.** The same workflow works directly and through Machinist.
 
+M2 through M4 require a dedicated single-worker deployment: one control plane, exactly one worker instance, and one active workflow invocation. Run direct and managed trials separately. The current runtime already requeues expired 30-second leases for any matching worker, so limiting the number of tickets does not prevent cross-worker duplication. Do not use an existing multi-worker deployment for these milestones. Before retrying or resuming, confirm the previous worker and its child processes have stopped; otherwise remain blocked. Automatic failover and adding another worker require M5's ownership protections first.
+
 Implement the canonical workflow with a stdin adapter, explicit maker/checker calls, bounded CI waiting, and feedback classification. Choose a tested local harness adapter first. Record workflow/prompt versions, executor version, PR/head identity, verification evidence, elapsed time, and reported usage. Keep stdout machine-readable and progress logs human-readable; retain full machine feedback as bounded-access artifacts rather than an endless terminal transcript.
 
 **Done when:** a ready issue produces one PR with applicable evidence; a seeded defect is fixed and rechecked; optional or self-authored feedback does not create endless repair passes; a missing decision stops without inventing requirements. No merge occurs.
 
-**Check:** unit tests of state transitions and a live run in an explicitly disposable repository. Exercise at least one full repair cycle. Verify terminal logs, result artifacts, process cancellation, and token reporting. Compare the final behavior with the issue's criteria rather than trusting the agent summary.
+**Check:** unit tests of state transitions and a live run in an explicitly disposable repository. Verify the dedicated deployment has one worker and no overlapping direct invocation. Exercise at least one full repair cycle. Verify terminal logs, result artifacts, process cancellation, and token reporting. Compare the final behavior with the issue's criteria rather than trusting the agent summary.
 
-**Dependencies:** M1. One active delivery is enough at this milestone.
+**Dependencies:** M1 and the single-worker deployment restriction above.
 
 ### M3. Resume interrupted work on the same worker
 
@@ -148,7 +150,7 @@ Classify environment failure separately from a code defect. Define limited retri
 
 Start with two independent deliveries, then four after the same checks pass. Each delivery owns an isolated workspace and PR. Dependencies wait for their agreed prerequisite condition; begin with merged prerequisites, then evaluate stacking as a separate feature if demand warrants it.
 
-Before cross-worker retries or automated intake, design shared delivery claims keyed by repository and issue. Local locks alone cannot stop two workers receiving separate jobs for the same ticket. Define ownership expiry, stale-worker behavior, reassignment, and reconciliation of remote effects. Reject stale state updates and prevent concurrent GitHub writes; terminal-result rejection alone does not stop a stale process from pushing code. Shared storage or state transfer for resume requires an explicit design at this stage.
+Before enabling a second worker, cross-worker retries, or automated intake, design shared delivery claims keyed by repository and issue. Local locks alone cannot stop two workers receiving separate jobs for the same ticket or the runtime reassigning an expired lease. Define ownership expiry, stale-worker behavior, reassignment, and reconciliation of remote effects. Reject stale state updates and prevent concurrent GitHub writes; terminal-result rejection alone does not stop a stale process from pushing code. Shared storage or state transfer for resume requires an explicit design at this stage.
 
 Add issue-label or event intake only after duplicate delivery is handled. Bound active jobs, agent concurrency, rate-limit usage, and per-delivery cost. Preserve cancellation and useful capacity for unrelated jobs when one delivery is blocked.
 
@@ -156,7 +158,7 @@ Add issue-label or event intake only after duplicate delivery is handled. Bound 
 
 **Check:** multi-worker duplicate-intake, expiry, network-partition, cancellation, and dependency scenarios. Publish the tested concurrency and workload. Do not claim arbitrary scale from a small successful demo.
 
-**Dependencies:** M3 and M4. The shared-claim and stale-worker design must pass review before enabling automatic reassignment or event intake.
+**Dependencies:** M3 and M4. The shared-claim and stale-worker design must pass review and its protections must be implemented and verified before enabling a second worker, automatic failover, or event intake.
 
 ### M6. Publish a repeatable factory example
 
