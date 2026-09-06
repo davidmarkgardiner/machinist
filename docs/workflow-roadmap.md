@@ -98,6 +98,8 @@ Inventory the existing examples against the lifecycle. Choose one canonical impl
 
 Include the isolated deployment and access controls required for M2 in that design. Assign each restriction to an actual deployment, credential, or repository control and define a test that would expose its absence. Identify required capabilities the current runtime does not provide. A prompt or repository mapping alone cannot satisfy an access restriction.
 
+Define M2's duplicate-run behavior too. Lease expiry can cause even the sole worker to receive the same run again after its stale completion is rejected. M2 must reject repeated execution before any agent or GitHub mutation; resumable execution is a later capability.
+
 **Done when:** every stage has an owner and stopping rule; the workflow has no dependency on skill routing; a sample issue can be traced to evidence and final status without conflicting loops.
 
 **Check:** independent architecture review and executable fixtures for success, a code defect, a correct change, a false review finding, missing CI, timeout, and missing authority. Review the deployment controls and their failure tests before authorizing the live trial. Fixtures are baseline tests, not claims of live reliability.
@@ -112,11 +114,15 @@ M2 through M4 require a dedicated single-worker deployment: one control plane, e
 
 Provision and verify M1's isolated environment before executing an agent on issue or review text. Keep host checkouts and production credentials unavailable to it. If a required access restriction cannot be demonstrated, stop the trial until the deployment provides it. This work belongs to the deployment setup; the roadmap does not claim that today's worker configuration supplies isolation.
 
+Before starting the maker, atomically create a durable local admission record for the repository and task, including the managed run ID when present. Keep it outside agent-writable files. A repeated invocation, including lease redispatch, returns a blocked result without starting an agent, changing GitHub, or resetting a repair budget. Do not automatically expire or clear the record. An interruption may therefore need human intervention in M2; M3 adds controlled resume from evidence. Include this admission guard in both the direct and stdin paths.
+
 Implement the canonical workflow with a stdin adapter, explicit maker/checker calls, bounded CI waiting, and feedback classification. Choose a tested local harness adapter first. Record workflow/prompt versions, executor version, PR/head identity, verification evidence, elapsed time, and reported usage. Keep stdout machine-readable and progress logs human-readable; retain full machine feedback as bounded-access artifacts rather than an endless terminal transcript.
 
 **Done when:** a ready issue produces one PR with applicable evidence; a seeded defect is fixed and rechecked; optional or self-authored feedback does not create endless repair passes; a missing decision stops without inventing requirements. No merge occurs.
 
 **Check:** unit tests of state transitions and a live run in an explicitly disposable repository. Verify the dedicated deployment has one worker and no overlapping direct invocation. Use non-sensitive fixtures to prove the configured access restrictions, including rejection of unauthorized GitHub operations and unavailable host files and credentials. Exercise at least one full repair cycle. Verify terminal logs, result artifacts, process cancellation, and token reporting. Compare the final behavior with the issue's criteria rather than trusting the agent summary.
+
+Inject a heartbeat outage longer than the 30-second lease and let the worker receive the same run again after completion rejection. Confirm the second invocation is blocked before an agent call or GitHub mutation. Repeat after a process restart and with a duplicate direct invocation. No test may treat renewed execution with a fresh repair budget as success.
 
 **Dependencies:** M1, its verified isolation controls, and the single-worker deployment restriction above.
 
@@ -124,7 +130,7 @@ Implement the canonical workflow with a stdin adapter, explicit maker/checker ca
 
 **Result.** Restarting a delivery preserves useful work and its repair budget.
 
-Store a versioned, workflow-owned checkpoint in durable worker storage. Track task identity, delivery identity, worktree and branch, PR and head, stage, repair reservations, and handled feedback. Use an exclusive per-delivery lock and atomic checkpoint replacement. Reconcile the checkpoint with Git and GitHub before proceeding; a checkpoint records claims that must be revalidated.
+Extend M2's admission record into a versioned, workflow-owned checkpoint in durable worker storage. Track task identity, delivery identity, worktree and branch, PR and head, stage, repair reservations, and handled feedback. Use an exclusive per-delivery lock and atomic checkpoint replacement. Reconcile the checkpoint with Git and GitHub before proceeding; a checkpoint records claims that must be revalidated. Only the explicit resume path may reopen an admitted delivery, after the previous execution has stopped.
 
 Test interruptions before and after commit, push, PR creation, and checkpoint writes. Preserve dirty or unpublished work. When identity or history conflicts, stop for a decision instead of creating a second PR or overwriting a branch. Retain the workspace while its PR is active; clean up only after merge or closure and verification that no unpublished work remains.
 
