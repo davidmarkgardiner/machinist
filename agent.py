@@ -92,7 +92,14 @@ def issue_url(value: str) -> str:
 
 def log(message: str) -> None:
     """Flush progress to stderr so redirected stdout remains one JSON result."""
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
+    # External review text must not send terminal commands or flood a log entry.
+    display = "".join(
+        char if char.isprintable() or char in "\n\t" else ascii(char)[1:-1]
+        for char in message[:4000]
+    )
+    if len(message) > 4000:
+        display += "\n    [truncated; full feedback is still available to the agent]"
+    print(f"[{time.strftime('%H:%M:%S')}] {display}", file=sys.stderr, flush=True)
 
 
 def log_feedback(feedback: dict) -> None:

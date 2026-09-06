@@ -243,6 +243,15 @@ class FeedbackTests(unittest.TestCase):
         stderr.__enter__()
         self.addCleanup(stderr.__exit__, None, None, None)
 
+    def test_logs_escape_terminal_controls_and_bound_display(self):
+        agent.log("Feedback: \x1b[2J\r" + "x" * 5000)
+        output = self.output.getvalue()
+        self.assertNotIn("\x1b", output)
+        self.assertNotIn("\r", output)
+        self.assertIn(r"\x1b[2J\r", output)
+        self.assertIn("truncated", output)
+        self.assertLess(len(output), 4200)
+
     def poll(self, snapshots, *, clock=None, reviews=None, head="abc"):
         replies = [
             *snapshots,
