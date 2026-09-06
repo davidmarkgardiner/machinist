@@ -3,6 +3,7 @@ listen = "127.0.0.1:7331"
 database = "~/.machinist/server/machinist.db"
 worker_token_file = "~/.machinist/server/worker.token"
 # max_concurrent_jobs = 1
+# fleet_release_policy_file = "~/.machinist/server/fleet-release-policy.json"
 
 [commands.foreman]
 executor = "codex"

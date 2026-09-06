@@ -217,12 +217,16 @@ func newStartCommand(options *commandOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			fleetReleasePolicy, err := serverConfig.FleetReleasePolicy()
+			if err != nil {
+				return err
+			}
 			store, err := controlplane.OpenStore(serverConfig.Database)
 			if err != nil {
 				return err
 			}
 			defer store.Close()
-			server, err := controlplane.NewServer(store, machinistConfig.Path(), token, serverConfig.ConcurrentJobLimit())
+			server, err := controlplane.NewServer(store, machinistConfig.Path(), token, serverConfig.ConcurrentJobLimit(), fleetReleasePolicy)
 			if err != nil {
 				return err
 			}

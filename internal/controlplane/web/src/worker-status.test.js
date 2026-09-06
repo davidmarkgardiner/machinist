@@ -9,6 +9,9 @@ test("workers show connected and disconnected poll status", async () => {
   assert.match(catalog, /worker\.connected \? "Connected" : "Disconnected"/);
   assert.match(catalog, /worker\.connected \? "[^"]*text-success"/);
   assert.match(catalog, /Last seen \{relativeTime\(worker\.last_seen_at\)\}/);
+  assert.match(catalog, /Release mismatch/);
+  assert.match(catalog, /Draining/);
+  assert.match(catalog, /worker\.fleet_release\.slice\(0, 12\)/);
   assert.match(main, /status\.workers\.filter\(\(worker\) => worker\.connected\)\.length/);
   assert.match(main, /worker\$\{connectedWorkers === 1 \? "" : "s"\} online/);
   assert.match(main, /truncate whitespace-nowrap/);

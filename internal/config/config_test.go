@@ -113,6 +113,62 @@ path = "repository"
 	}
 }
 
+func TestWorkerFleetReleaseAndDrainState(t *testing.T) {
+	directory := t.TempDir()
+	releasePath := filepath.Join(directory, "release")
+	drainPath := filepath.Join(directory, "drain")
+	release := strings.Repeat("a", 40)
+	writeTestFile(t, releasePath, release+"\n")
+	worker, err := applyWorkerDefaultsWithHostname(Worker{Name: "worker", DataDirectory: directory, FleetReleaseFile: releasePath, DrainFile: drainPath}, func() (string, error) {
+		return "unused", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, state := worker.FleetRelease(); got != release || state != "ready" || !worker.AcceptingWork() {
+		t.Fatalf("release = %q state = %q accepting = %v", got, state, worker.AcceptingWork())
+	}
+	writeTestFile(t, drainPath, "updating\n")
+	if worker.AcceptingWork() {
+		t.Fatal("worker with drain marker is accepting work")
+	}
+	writeTestFile(t, releasePath, "not-a-release\n")
+	if got, state := worker.FleetRelease(); got != "" || state != "error" {
+		t.Fatalf("invalid release = %q state = %q", got, state)
+	}
+}
+
+func TestFleetReleasePolicyValidation(t *testing.T) {
+	directory := t.TempDir()
+	required := strings.Repeat("a", 40)
+	accepted := strings.Repeat("b", 64)
+	path := filepath.Join(directory, "policy.json")
+	writeTestFile(t, path, `{"required":"`+required+`","accepted":["`+required+`","`+accepted+`","`+required+`"]}`)
+	policy, err := (Server{FleetReleasePolicyFile: path}).FleetReleasePolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Required != required || !policy.Allows(required) || !policy.Allows(accepted) || len(policy.Accepted) != 2 {
+		t.Fatalf("policy = %#v", policy)
+	}
+	writeTestFile(t, path, `{"required":"`+required+`","accepted":["`+accepted+`"]}`)
+	if _, err := (Server{FleetReleasePolicyFile: path}).FleetReleasePolicy(); err == nil || !strings.Contains(err.Error(), "must be accepted") {
+		t.Fatalf("policy error = %v", err)
+	}
+	writeTestFile(t, path, `{"required":"","accepted":[]}`)
+	if policy, err := (Server{FleetReleasePolicyFile: path}).FleetReleasePolicy(); err != nil || policy.Required != "" || len(policy.Accepted) != 0 {
+		t.Fatalf("disabled policy = %#v, %v", policy, err)
+	}
+	writeTestFile(t, path, `{"required":"","accepted":["`+required+`"]}`)
+	if _, err := (Server{FleetReleasePolicyFile: path}).FleetReleasePolicy(); err == nil || !strings.Contains(err.Error(), "require a required") {
+		t.Fatalf("disabled policy with accepted releases error = %v", err)
+	}
+	writeTestFile(t, path, `{"require":"`+required+`","accepted":["`+required+`"]}`)
+	if _, err := (Server{FleetReleasePolicyFile: path}).FleetReleasePolicy(); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("unknown policy field error = %v", err)
+	}
+}
+
 func TestLoadConfigCombinesServerAndCommands(t *testing.T) {
 	directory := t.TempDir()
 	writeTestFile(t, filepath.Join(directory, "token"), "secret")

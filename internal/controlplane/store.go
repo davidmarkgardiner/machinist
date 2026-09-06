@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -71,11 +72,16 @@ type Run struct {
 }
 
 type Worker struct {
-	InstanceID   string    `json:"instance_id"`
-	Name         string    `json:"name"`
-	LastSeenAt   time.Time `json:"last_seen_at"`
-	Repositories []string  `json:"repositories"`
-	Connected    bool      `json:"connected"`
+	InstanceID        string    `json:"instance_id"`
+	Name              string    `json:"name"`
+	LastSeenAt        time.Time `json:"last_seen_at"`
+	Repositories      []string  `json:"repositories"`
+	FleetRelease      string    `json:"fleet_release,omitempty"`
+	ReleaseState      string    `json:"release_state,omitempty"`
+	AcceptingWork     bool      `json:"accepting_work"`
+	ReleaseCompatible bool      `json:"release_compatible"`
+	ReleaseCurrent    bool      `json:"release_current"`
+	Connected         bool      `json:"connected"`
 }
 
 type Snapshot struct {
@@ -172,7 +178,7 @@ func OpenStore(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) initialize(ctx context.Context) error {
-	const schemaVersion = 2
+	const schemaVersion = 3
 	var version int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return fmt.Errorf("read database schema version: %w", err)
@@ -192,6 +198,12 @@ DROP TABLE IF EXISTS runs; DROP TABLE IF EXISTS jobs; PRAGMA foreign_keys=ON;`);
 		if err := s.upgradeToVersionTwo(ctx); err != nil {
 			return fmt.Errorf("upgrade database schema to version 2: %w", err)
 		}
+		version = 2
+	}
+	if version == 2 {
+		if err := s.upgradeToVersionThree(ctx); err != nil {
+			return fmt.Errorf("upgrade database schema to version 3: %w", err)
+		}
 	}
 	const schema = `
 PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
@@ -208,7 +220,7 @@ CREATE TABLE IF NOT EXISTS runs (
  lease_token TEXT, lease_expires_at INTEGER, exit_code INTEGER, error TEXT, result TEXT, events TEXT,
  started_at TEXT, completed_at TEXT, duration_millis INTEGER, token_usage INTEGER);
 CREATE INDEX IF NOT EXISTS runs_dispatch ON runs(state, job_id);
-CREATE TABLE IF NOT EXISTS workers (instance_id TEXT PRIMARY KEY, name TEXT NOT NULL, last_seen_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS workers (instance_id TEXT PRIMARY KEY, name TEXT NOT NULL, last_seen_at TEXT NOT NULL, fleet_release TEXT NOT NULL DEFAULT '', release_state TEXT NOT NULL DEFAULT '', accepting_work INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS worker_repositories (worker_instance TEXT NOT NULL REFERENCES workers(instance_id) ON DELETE CASCADE, repository TEXT NOT NULL, PRIMARY KEY(worker_instance,repository));
 CREATE TABLE IF NOT EXISTS known_repositories (repository TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS trigger_state (identity TEXT PRIMARY KEY,family TEXT NOT NULL,config_signature TEXT NOT NULL,generation_id TEXT NOT NULL,next_due_at TEXT,pending_occurrence_at TEXT,last_attempt_at TEXT,last_success_at TEXT,last_job_state TEXT NOT NULL DEFAULT '',last_job_error TEXT NOT NULL DEFAULT '',health TEXT NOT NULL DEFAULT 'healthy',latest_error TEXT NOT NULL DEFAULT '',candidate_count INTEGER NOT NULL DEFAULT 0,admission_count INTEGER NOT NULL DEFAULT 0,coalesced_count INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
@@ -217,11 +229,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_trigger_occurrence ON jobs(trigger_identi
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_fixed_trigger ON jobs(trigger_identity) WHERE fixed_trigger=1 AND state IN ('queued','running');
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_trigger_subject ON jobs(trigger_subject) WHERE trigger_subject<>'' AND state IN ('queued','running');
 CREATE INDEX IF NOT EXISTS github_trigger_requests_reconciliation ON github_trigger_requests(trigger_identity,needs_reconciliation,requested_at);
-PRAGMA user_version=2;`
+PRAGMA user_version=3;`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize database: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) upgradeToVersionThree(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS workers (instance_id TEXT PRIMARY KEY, name TEXT NOT NULL, last_seen_at TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	for column, statement := range map[string]string{
+		"fleet_release":  `ALTER TABLE workers ADD COLUMN fleet_release TEXT NOT NULL DEFAULT ''`,
+		"release_state":  `ALTER TABLE workers ADD COLUMN release_state TEXT NOT NULL DEFAULT ''`,
+		"accepting_work": `ALTER TABLE workers ADD COLUMN accepting_work INTEGER NOT NULL DEFAULT 1`,
+	} {
+		var present int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('workers') WHERE name=?`, column).Scan(&present); err != nil {
+			return err
+		}
+		if present == 0 {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `PRAGMA user_version=3`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // upgradeToVersionTwo removes the Shepherd schedule bookkeeping. Finished jobs
@@ -709,12 +751,12 @@ func (s *Store) AddTriggerCoalesced(ctx context.Context, identity, configGenerat
 }
 
 func (s *Store) Poll(ctx context.Context, request protocol.PollRequest) (*protocol.RunSpec, error) {
-	return s.poll(ctx, request, 0)
+	return s.poll(ctx, request, 0, config.FleetReleasePolicy{})
 }
 
 // poll allows at most maxConcurrentJobs running jobs. Zero leaves concurrency
 // unlimited. Expired leases remain eligible so interrupted work can make progress.
-func (s *Store) poll(ctx context.Context, request protocol.PollRequest, maxConcurrentJobs int) (*protocol.RunSpec, error) {
+func (s *Store) poll(ctx context.Context, request protocol.PollRequest, maxConcurrentJobs int, releasePolicy config.FleetReleasePolicy) (*protocol.RunSpec, error) {
 	if maxConcurrentJobs < 0 {
 		return nil, errors.New("max concurrent jobs cannot be negative")
 	}
@@ -725,7 +767,8 @@ func (s *Store) poll(ctx context.Context, request protocol.PollRequest, maxConcu
 	defer tx.Rollback()
 	nowTime := s.now().UTC()
 	now := nowTime.Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO workers(instance_id,name,last_seen_at) VALUES(?,?,?) ON CONFLICT(instance_id) DO UPDATE SET name=excluded.name,last_seen_at=excluded.last_seen_at`, request.InstanceID, request.Name, now); err != nil {
+	acceptingWork := request.AcceptingWork == nil || *request.AcceptingWork
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workers(instance_id,name,last_seen_at,fleet_release,release_state,accepting_work) VALUES(?,?,?,?,?,?) ON CONFLICT(instance_id) DO UPDATE SET name=excluded.name,last_seen_at=excluded.last_seen_at,fleet_release=excluded.fleet_release,release_state=excluded.release_state,accepting_work=excluded.accepting_work`, request.InstanceID, request.Name, now, request.FleetRelease, request.ReleaseState, acceptingWork); err != nil {
 		return nil, fmt.Errorf("update worker: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, reclaimExpiredLeasesSQL, nowTime.UnixNano()); err != nil {
@@ -752,6 +795,12 @@ func (s *Store) poll(ctx context.Context, request protocol.PollRequest, maxConcu
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
+	}
+	if !acceptingWork || request.ReleaseState == "error" || !releasePolicy.Allows(request.FleetRelease) {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 	atCapacity := false
 	if maxConcurrentJobs > 0 {
@@ -1011,26 +1060,36 @@ func (s *Store) TriggerSnapshot(ctx context.Context) ([]TriggerStatus, error) {
 	return statuses, nil
 }
 
-func (s *Store) AvailableRepositories(ctx context.Context, seenAfter time.Time) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT wr.repository
+func (s *Store) AvailableRepositories(ctx context.Context, seenAfter time.Time, releasePolicy config.FleetReleasePolicy) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT wr.repository,w.fleet_release,w.release_state,w.accepting_work
 FROM worker_repositories wr
 JOIN workers w ON w.instance_id=wr.worker_instance
-WHERE julianday(w.last_seen_at) >= julianday(?)
-   OR EXISTS (SELECT 1 FROM runs r WHERE r.worker_instance=w.instance_id AND r.state='running')
+WHERE julianday(w.last_seen_at) >= julianday(?) OR EXISTS (SELECT 1 FROM runs r WHERE r.worker_instance=w.instance_id AND r.state='running')
 ORDER BY wr.repository`, seenAfter.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	repositories := []string{}
+	repositorySet := map[string]bool{}
 	for rows.Next() {
-		var repository string
-		if err := rows.Scan(&repository); err != nil {
+		var repository, fleetRelease, releaseState string
+		var acceptingWork bool
+		if err := rows.Scan(&repository, &fleetRelease, &releaseState, &acceptingWork); err != nil {
 			return nil, err
 		}
+		if acceptingWork && releaseState != "error" && releasePolicy.Allows(fleetRelease) {
+			repositorySet[repository] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	repositories := make([]string, 0, len(repositorySet))
+	for repository := range repositorySet {
 		repositories = append(repositories, repository)
 	}
-	return repositories, rows.Err()
+	slices.Sort(repositories)
+	return repositories, nil
 }
 
 func (s *Store) KnownRepositories(ctx context.Context) ([]string, error) {
@@ -1115,7 +1174,7 @@ func elapsedMillis(startedAt, completedAt string) *int64 {
 }
 
 func (s *Store) listWorkers(ctx context.Context) ([]Worker, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT instance_id,name,last_seen_at FROM workers ORDER BY name,instance_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT instance_id,name,last_seen_at,fleet_release,release_state,accepting_work FROM workers ORDER BY name,instance_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1123,7 +1182,7 @@ func (s *Store) listWorkers(ctx context.Context) ([]Worker, error) {
 	for rows.Next() {
 		worker := Worker{Repositories: []string{}}
 		var lastSeen string
-		if err := rows.Scan(&worker.InstanceID, &worker.Name, &lastSeen); err != nil {
+		if err := rows.Scan(&worker.InstanceID, &worker.Name, &lastSeen, &worker.FleetRelease, &worker.ReleaseState, &worker.AcceptingWork); err != nil {
 			rows.Close()
 			return nil, err
 		}

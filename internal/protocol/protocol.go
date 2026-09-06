@@ -3,15 +3,19 @@ package protocol
 import "encoding/json"
 
 type PollRequest struct {
-	InstanceID   string              `json:"instance_id"`
-	Name         string              `json:"name"`
-	Executors    []string            `json:"executors"`
-	Repositories []string            `json:"repositories"`
-	Models       map[string][]string `json:"models,omitempty"`
+	InstanceID    string              `json:"instance_id"`
+	Name          string              `json:"name"`
+	Executors     []string            `json:"executors"`
+	Repositories  []string            `json:"repositories"`
+	Models        map[string][]string `json:"models,omitempty"`
+	FleetRelease  string              `json:"fleet_release,omitempty"`
+	ReleaseState  string              `json:"release_state,omitempty"`
+	AcceptingWork *bool               `json:"accepting_work,omitempty"`
 }
 
 type PollResponse struct {
-	Run *RunSpec `json:"run,omitempty"`
+	Run                  *RunSpec `json:"run,omitempty"`
+	RequiredFleetRelease string   `json:"required_fleet_release,omitempty"`
 }
 
 type RunSpec struct {
