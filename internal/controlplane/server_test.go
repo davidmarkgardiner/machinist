@@ -151,6 +151,32 @@ func TestServerDeletesOnlyTerminalJobsWithSubmissionAuthorization(t *testing.T) 
 	}
 }
 
+func TestServerCancelsActiveJobWithSubmissionAuthorization(t *testing.T) {
+	server, webServer := newTestHTTPServer(t)
+	defer webServer.Close()
+	jobID, err := server.store.CreateJob(t.Context(), "request", "machinist", "plan", testAgent("plan", "Plan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := postJSON(t, webServer.URL+"/api/v1/jobs/"+jobID+"/cancel", nil, nil)
+	if unauthorized.StatusCode != http.StatusForbidden {
+		t.Fatalf("unauthorized cancel status = %d", unauthorized.StatusCode)
+	}
+	unauthorized.Body.Close()
+
+	status := getStatus(t, webServer.URL)
+	headers := map[string]string{"Origin": webServer.URL, "X-Machinist-CSRF": status.CSRFToken}
+	cancelled := postJSON(t, webServer.URL+"/api/v1/jobs/"+jobID+"/cancel", nil, headers)
+	if cancelled.StatusCode != http.StatusNoContent {
+		t.Fatalf("cancel status = %d", cancelled.StatusCode)
+	}
+	cancelled.Body.Close()
+	jobs := getStatus(t, webServer.URL).Jobs
+	if len(jobs) != 1 || jobs[0].State != "cancelled" || jobs[0].Runs[0].State != "cancelled" {
+		t.Fatalf("jobs after cancel = %#v", jobs)
+	}
+}
+
 func TestServerAppliesConcurrentJobLimitToWorkerPolls(t *testing.T) {
 	server, webServer := newTestHTTPServerWithLimit(t, 1)
 	defer webServer.Close()
@@ -261,6 +287,57 @@ func TestServerAcceptsBearerSubmissionAndRejectsInvalidToken(t *testing.T) {
 	status := getStatus(t, webServer.URL)
 	if len(status.Jobs) != 1 || status.Jobs[0].Prompt != "queue from terminal" {
 		t.Fatalf("jobs after bearer submissions = %#v", status.Jobs)
+	}
+}
+
+func TestServerMakesSubmissionRetriesIdempotent(t *testing.T) {
+	_, webServer := newTestHTTPServer(t)
+	defer webServer.Close()
+	headers := map[string]string{"Authorization": "Bearer secret"}
+	poll := postJSON(t, webServer.URL+"/api/v1/workers/poll", map[string]any{
+		"instance_id": "worker-a", "name": "test-worker", "executors": []string{"test"}, "repositories": []string{"machinist"},
+	}, headers)
+	poll.Body.Close()
+
+	request := map[string]string{
+		"prompt": "queue exactly once", "repository": "machinist", "command": "plan", "idempotency_key": "issue-13-review",
+	}
+	created := postJSON(t, webServer.URL+"/api/v1/jobs", request, headers)
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("first submission status = %d", created.StatusCode)
+	}
+	var first struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(created.Body).Decode(&first); err != nil {
+		t.Fatal(err)
+	}
+	created.Body.Close()
+
+	replayed := postJSON(t, webServer.URL+"/api/v1/jobs", request, headers)
+	if replayed.StatusCode != http.StatusOK {
+		t.Fatalf("retry status = %d", replayed.StatusCode)
+	}
+	var second struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(replayed.Body).Decode(&second); err != nil {
+		t.Fatal(err)
+	}
+	replayed.Body.Close()
+	if second.ID != first.ID {
+		t.Fatalf("retry job = %q, want %q", second.ID, first.ID)
+	}
+
+	request["prompt"] = "different work"
+	conflict := postJSON(t, webServer.URL+"/api/v1/jobs", request, headers)
+	if conflict.StatusCode != http.StatusConflict {
+		t.Fatalf("changed retry status = %d, want conflict", conflict.StatusCode)
+	}
+	conflict.Body.Close()
+	status := getStatus(t, webServer.URL)
+	if len(status.Jobs) != 1 {
+		t.Fatalf("jobs after retries = %#v", status.Jobs)
 	}
 }
 

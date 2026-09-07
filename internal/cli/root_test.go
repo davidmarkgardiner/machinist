@@ -393,6 +393,7 @@ func TestSubmitQueuesAgentWithConfiguredBearerToken(t *testing.T) {
 		"submit",
 		"--command=plan",
 		"--model=luna",
+		"--idempotency-key=issue-13-plan",
 		"--prompt=fix issue 13",
 		"--repo=machinist",
 		"--config=" + workerConfig,
@@ -403,8 +404,30 @@ func TestSubmitQueuesAgentWithConfiguredBearerToken(t *testing.T) {
 	if gotAuthorization != "Bearer secret" {
 		t.Fatalf("authorization = %q", gotAuthorization)
 	}
-	if gotRequest != (submitJobRequest{Prompt: "fix issue 13", Repository: "machinist", Command: "plan", Model: "luna"}) {
+	if gotRequest != (submitJobRequest{Prompt: "fix issue 13", Repository: "machinist", Command: "plan", Model: "luna", IdempotencyKey: "issue-13-plan"}) {
 		t.Fatalf("submission = %#v", gotRequest)
+	}
+}
+
+func TestCancelRequestsOneManagedJob(t *testing.T) {
+	var gotPath, gotAuthorization string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		gotPath = request.URL.Path
+		gotAuthorization = request.Header.Get("Authorization")
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	workerConfig := writeSubmitWorkerConfig(t, server.URL, "secret")
+
+	var stdout, stderr bytes.Buffer
+	exitCode := Execute(t.Context(), []string{
+		"cancel", "job_123", "--config=" + workerConfig,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if exitCode != 0 || stdout.String() != "job_123\n" {
+		t.Fatalf("exit code = %d, stdout = %q, stderr = %q", exitCode, stdout.String(), stderr.String())
+	}
+	if gotPath != "/api/v1/jobs/job_123/cancel" || gotAuthorization != "Bearer secret" {
+		t.Fatalf("cancel path = %q authorization = %q", gotPath, gotAuthorization)
 	}
 }
 

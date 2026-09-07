@@ -25,6 +25,8 @@ var (
 	ErrRunState                        = errors.New("run is not active")
 	ErrInvalidCompletion               = errors.New("invalid run completion")
 	ErrJobActive                       = errors.New("active job cannot be deleted")
+	ErrJobTerminal                     = errors.New("terminal job cannot be cancelled")
+	ErrIdempotencyConflict             = errors.New("idempotency key already belongs to a different submission")
 	ErrTriggerMissing                  = errors.New("trigger state does not exist")
 	ErrTriggerStale                    = errors.New("trigger state configuration changed")
 	ErrTriggerPreviousGenerationActive = errors.New("previous trigger configuration still has active work")
@@ -32,9 +34,7 @@ var (
 
 const leaseDuration = 30 * time.Second
 const maxTriggerErrorLength = 2000
-
-// reclaimExpiredLeasesSQL returns running runs whose lease lapsed to the queue.
-const reclaimExpiredLeasesSQL = `UPDATE runs SET state='queued',worker_instance=NULL,worker_name='',lease_token=NULL,lease_expires_at=NULL,started_at=NULL WHERE state='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)`
+const expiredLeaseError = "worker lease expired; manual reconciliation required"
 
 type Store struct {
 	db  *sql.DB
@@ -178,7 +178,7 @@ func OpenStore(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) initialize(ctx context.Context) error {
-	const schemaVersion = 3
+	const schemaVersion = 4
 	var version int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return fmt.Errorf("read database schema version: %w", err)
@@ -204,6 +204,12 @@ DROP TABLE IF EXISTS runs; DROP TABLE IF EXISTS jobs; PRAGMA foreign_keys=ON;`);
 		if err := s.upgradeToVersionThree(ctx); err != nil {
 			return fmt.Errorf("upgrade database schema to version 3: %w", err)
 		}
+		version = 3
+	}
+	if version == 3 {
+		if err := s.upgradeToVersionFour(ctx); err != nil {
+			return fmt.Errorf("upgrade database schema to version 4: %w", err)
+		}
 	}
 	const schema = `
 PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
@@ -212,7 +218,8 @@ CREATE TABLE IF NOT EXISTS jobs (
  trigger_identity TEXT NOT NULL DEFAULT '', trigger_config_signature TEXT NOT NULL DEFAULT '',
  trigger_generation_id TEXT NOT NULL DEFAULT '', occurrence_key TEXT NOT NULL DEFAULT '',
  trigger_subject TEXT NOT NULL DEFAULT '', github_issue_title TEXT NOT NULL DEFAULT '',
- fixed_trigger INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ submission_key TEXT NOT NULL DEFAULT '', fixed_trigger INTEGER NOT NULL DEFAULT 0,
+ state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS runs (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id), command TEXT NOT NULL, command_hash TEXT NOT NULL,
  executor TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, rendered_prompt TEXT NOT NULL,
@@ -228,12 +235,44 @@ CREATE TABLE IF NOT EXISTS github_trigger_requests (trigger_identity TEXT NOT NU
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_trigger_occurrence ON jobs(trigger_identity,occurrence_key) WHERE trigger_identity<>'' AND occurrence_key<>'';
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_fixed_trigger ON jobs(trigger_identity) WHERE fixed_trigger=1 AND state IN ('queued','running');
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_trigger_subject ON jobs(trigger_subject) WHERE trigger_subject<>'' AND state IN ('queued','running');
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_submission_key ON jobs(submission_key) WHERE submission_key<>'';
 CREATE INDEX IF NOT EXISTS github_trigger_requests_reconciliation ON github_trigger_requests(trigger_identity,needs_reconciliation,requested_at);
-PRAGMA user_version=3;`
+PRAGMA user_version=4;`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize database: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) upgradeToVersionFour(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var tablePresent int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs'`).Scan(&tablePresent); err != nil {
+		return err
+	}
+	if tablePresent == 0 {
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	var present int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name='submission_key'`).Scan(&present); err != nil {
+		return err
+	}
+	if present == 0 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN submission_key TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS jobs_submission_key ON jobs(submission_key) WHERE submission_key<>''; PRAGMA user_version=4`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) upgradeToVersionThree(ctx context.Context) error {
@@ -321,33 +360,62 @@ func (s *Store) drainScheduledJobs(ctx context.Context, tx *sql.Tx) error {
 }
 
 func (s *Store) CreateJob(ctx context.Context, prompt, repository, name string, command config.ResolvedCommand) (string, error) {
+	jobID, _, err := s.CreateJobIdempotent(ctx, prompt, repository, name, "", command)
+	return jobID, err
+}
+
+// CreateJobIdempotent persists a submission key with the job. Replaying the
+// same key and exact resolved request returns the original job without adding
+// another run; reusing it for different work fails closed.
+func (s *Store) CreateJobIdempotent(ctx context.Context, prompt, repository, name, submissionKey string, command config.ResolvedCommand) (string, bool, error) {
 	if command.Name == "" {
-		return "", errors.New("job must contain one command")
-	}
-	jobID, err := randomID("job", 12)
-	if err != nil {
-		return "", err
+		return "", false, errors.New("job must contain one command")
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id,prompt,repository,command,state,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)`, jobID, prompt, repository, name, now, now); err != nil {
-		return "", fmt.Errorf("insert job: %w", err)
+	if submissionKey != "" {
+		var existingID, existingPrompt, existingRepository, existingName string
+		var existingCommand, existingHash, existingExecutor, existingModel, existingRenderedPrompt string
+		var existingTimeout int64
+		err := tx.QueryRowContext(ctx, `SELECT jobs.id,jobs.prompt,jobs.repository,jobs.command,runs.command,runs.command_hash,runs.executor,runs.model,runs.rendered_prompt,runs.timeout_ms
+FROM jobs JOIN runs ON runs.job_id=jobs.id WHERE jobs.submission_key=?`, submissionKey).Scan(
+			&existingID, &existingPrompt, &existingRepository, &existingName, &existingCommand, &existingHash,
+			&existingExecutor, &existingModel, &existingRenderedPrompt, &existingTimeout,
+		)
+		if err == nil {
+			if existingPrompt != prompt || existingRepository != repository || existingName != name ||
+				existingCommand != command.Name || existingHash != command.Hash || existingExecutor != command.Executor ||
+				existingModel != command.Model || existingRenderedPrompt != command.Prompt || existingTimeout != command.Timeout.Milliseconds() {
+				return "", false, ErrIdempotencyConflict
+			}
+			return existingID, false, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", false, fmt.Errorf("look up idempotent submission: %w", err)
+		}
+	}
+	jobID, err := randomID("job", 12)
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id,prompt,repository,command,submission_key,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?)`, jobID, prompt, repository, name, submissionKey, now, now); err != nil {
+		return "", false, fmt.Errorf("insert job: %w", err)
 	}
 	runID, err := randomID("run", 12)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id,job_id,command,command_hash,executor,model,repository,rendered_prompt,timeout_ms,state) VALUES(?,?,?,?,?,?,?,?,?,'queued')`, runID, jobID, command.Name, command.Hash, command.Executor, command.Model, repository, command.Prompt, command.Timeout.Milliseconds()); err != nil {
-		return "", fmt.Errorf("insert run: %w", err)
+		return "", false, fmt.Errorf("insert run: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return "", fmt.Errorf("commit job: %w", err)
+		return "", false, fmt.Errorf("commit job: %w", err)
 	}
-	return jobID, nil
+	return jobID, true, nil
 }
 
 // SyncTriggers makes the durable trigger set match the resolved configuration. Existing
@@ -771,8 +839,8 @@ func (s *Store) poll(ctx context.Context, request protocol.PollRequest, maxConcu
 	if _, err := tx.ExecContext(ctx, `INSERT INTO workers(instance_id,name,last_seen_at,fleet_release,release_state,accepting_work) VALUES(?,?,?,?,?,?) ON CONFLICT(instance_id) DO UPDATE SET name=excluded.name,last_seen_at=excluded.last_seen_at,fleet_release=excluded.fleet_release,release_state=excluded.release_state,accepting_work=excluded.accepting_work`, request.InstanceID, request.Name, now, request.FleetRelease, request.ReleaseState, acceptingWork); err != nil {
 		return nil, fmt.Errorf("update worker: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, reclaimExpiredLeasesSQL, nowTime.UnixNano()); err != nil {
-		return nil, fmt.Errorf("reclaim expired leases: %w", err)
+	if _, err := quarantineExpiredLeases(ctx, tx, nowTime); err != nil {
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM worker_repositories WHERE worker_instance=?`, request.InstanceID); err != nil {
 		return nil, fmt.Errorf("clear worker repositories: %w", err)
@@ -992,12 +1060,101 @@ func (s *Store) DeleteJob(ctx context.Context, jobID string) error {
 	return tx.Commit()
 }
 
-func (s *Store) ReclaimExpiredLeases(ctx context.Context) (int64, error) {
-	result, err := s.db.ExecContext(ctx, reclaimExpiredLeasesSQL, s.now().UTC().UnixNano())
+// CancelJob atomically makes a queued or running job terminal. A leased worker
+// observes the state change as a heartbeat conflict and cancels its process
+// group; no other worker can lease the cancelled run.
+func (s *Store) CancelJob(ctx context.Context, jobID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("reclaim expired leases: %w", err)
+		return err
 	}
-	return result.RowsAffected()
+	defer tx.Rollback()
+	var state, triggerIdentity, triggerGeneration string
+	if err := tx.QueryRowContext(ctx, `SELECT state,trigger_identity,trigger_generation_id FROM jobs WHERE id=?`, jobID).Scan(&state, &triggerIdentity, &triggerGeneration); err != nil {
+		return err
+	}
+	if state == "cancelled" {
+		return nil
+	}
+	if terminalRunState(state) {
+		return ErrJobTerminal
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	const reason = "cancelled by operator"
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET state='cancelled',lease_token=NULL,lease_expires_at=NULL,exit_code=130,error=?,completed_at=? WHERE job_id=? AND state IN ('queued','running')`, reason, now, jobID)
+	if err != nil {
+		return fmt.Errorf("cancel run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrJobTerminal
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='cancelled',updated_at=? WHERE id=?`, now, jobID); err != nil {
+		return fmt.Errorf("cancel job: %w", err)
+	}
+	if triggerIdentity != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE trigger_state SET last_job_state='cancelled',last_job_error=?,health='failed',latest_error=?,updated_at=? WHERE identity=? AND generation_id=?`, reason, reason, now, triggerIdentity, triggerGeneration); err != nil {
+			return fmt.Errorf("record cancelled trigger: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) QuarantineExpiredLeases(ctx context.Context) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	quarantined, err := quarantineExpiredLeases(ctx, tx, s.now().UTC())
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return quarantined, nil
+}
+
+// quarantineExpiredLeases fails closed instead of redispatching work whose
+// previous process may still be able to mutate an external system. Recovery
+// requires a new, explicitly admitted job after an operator reconciles the
+// repository and any other side effects.
+func quarantineExpiredLeases(ctx context.Context, tx *sql.Tx, nowTime time.Time) (int64, error) {
+	now := nowTime.Format(time.RFC3339Nano)
+	expiresAt := nowTime.UnixNano()
+	expiredRun := `r.state='running' AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?)`
+	if _, err := tx.ExecContext(ctx, `UPDATE trigger_state SET
+  last_job_state='failed',last_job_error=?,health='failed',latest_error=?,updated_at=?
+WHERE EXISTS (
+  SELECT 1 FROM jobs j JOIN runs r ON r.job_id=j.id
+  WHERE j.trigger_identity=trigger_state.identity
+    AND j.trigger_generation_id=trigger_state.generation_id
+    AND `+expiredRun+`
+)`, expiredLeaseError, expiredLeaseError, now, expiresAt); err != nil {
+		return 0, fmt.Errorf("quarantine expired lease trigger: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='failed',updated_at=?
+WHERE state='running' AND EXISTS (
+  SELECT 1 FROM runs r WHERE r.job_id=jobs.id AND `+expiredRun+`
+)`, now, expiresAt); err != nil {
+		return 0, fmt.Errorf("quarantine expired lease job: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET
+  state='failed',worker_instance=NULL,lease_token=NULL,lease_expires_at=NULL,
+  exit_code=1,error=?,completed_at=?
+WHERE state='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)`, expiredLeaseError, now, expiresAt)
+	if err != nil {
+		return 0, fmt.Errorf("quarantine expired lease run: %w", err)
+	}
+	quarantined, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return quarantined, nil
 }
 
 func (s *Store) PruneSupersededWorkers(ctx context.Context, seenAfter time.Time) (int64, error) {

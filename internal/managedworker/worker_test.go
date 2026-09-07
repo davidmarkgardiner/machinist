@@ -343,7 +343,7 @@ func TestManagedWorkerPollReportsFleetReleaseAndDrainState(t *testing.T) {
 	}
 }
 
-func TestManagedWorkerHeartbeatsDuringExecutionAndContinuesAfterFailure(t *testing.T) {
+func TestManagedWorkerHeartbeatsDuringExecutionAndContinuesAfterTransientFailure(t *testing.T) {
 	if heartbeatInterval != 10*time.Second {
 		t.Fatalf("heartbeat interval = %v", heartbeatInterval)
 	}
@@ -406,6 +406,87 @@ func TestManagedWorkerHeartbeatsDuringExecutionAndContinuesAfterFailure(t *testi
 	}
 	if !strings.Contains(stderr.String(), "machinist: heartbeat run run-test") {
 		t.Fatalf("heartbeat failure was not logged: %q", stderr.String())
+	}
+}
+
+func TestManagedWorkerCancelsExecutionBeforeLeaseExpiresAfterHeartbeatFailures(t *testing.T) {
+	ticks := make(chan time.Time, heartbeatFailureLimit)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/v1/runs/run-test/heartbeat" {
+			t.Errorf("request path = %q", request.URL.Path)
+		}
+		http.Error(response, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	started := make(chan struct{})
+	var stderr strings.Builder
+	worker := &Worker{
+		config:         config.Worker{ControlPlane: config.ControlPlane{URL: server.URL}},
+		instanceID:     "worker-test",
+		client:         newClient(server.URL, "secret", server.Client()),
+		stderr:         &stderr,
+		heartbeatTicks: ticks,
+		executeRun: func(ctx context.Context, _ protocol.RunSpec) protocol.Completion {
+			close(started)
+			<-ctx.Done()
+			return protocol.Completion{State: "cancelled", ExitCode: 130, Error: ctx.Err().Error()}
+		},
+	}
+	done := make(chan protocol.Completion, 1)
+	go func() {
+		done <- worker.executeWithHeartbeats(t.Context(), protocol.RunSpec{ID: "run-test", LeaseToken: "lease-test"})
+	}()
+	<-started
+	for range heartbeatFailureLimit {
+		ticks <- time.Time{}
+	}
+	select {
+	case completion := <-done:
+		if completion.State != "cancelled" || completion.ExitCode != 130 {
+			t.Fatalf("completion = %#v", completion)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("execution was not cancelled after repeated heartbeat failures")
+	}
+	if !strings.Contains(stderr.String(), "cancelling run run-test after lease heartbeat failure") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestManagedWorkerCancelsExecutionImmediatelyAfterLeaseConflict(t *testing.T) {
+	ticks := make(chan time.Time, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		http.Error(response, "run lease does not match", http.StatusConflict)
+	}))
+	defer server.Close()
+
+	started := make(chan struct{})
+	worker := &Worker{
+		config:         config.Worker{ControlPlane: config.ControlPlane{URL: server.URL}},
+		instanceID:     "worker-test",
+		client:         newClient(server.URL, "secret", server.Client()),
+		stderr:         io.Discard,
+		heartbeatTicks: ticks,
+		executeRun: func(ctx context.Context, _ protocol.RunSpec) protocol.Completion {
+			close(started)
+			<-ctx.Done()
+			return protocol.Completion{State: "cancelled", ExitCode: 130}
+		},
+	}
+	done := make(chan protocol.Completion, 1)
+	go func() {
+		done <- worker.executeWithHeartbeats(t.Context(), protocol.RunSpec{ID: "run-test", LeaseToken: "lease-test"})
+	}()
+	<-started
+	ticks <- time.Time{}
+	select {
+	case completion := <-done:
+		if completion.State != "cancelled" {
+			t.Fatalf("completion = %#v", completion)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("execution was not cancelled after lease conflict")
 	}
 }
 

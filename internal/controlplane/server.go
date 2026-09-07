@@ -59,10 +59,11 @@ type statusResponse struct {
 }
 
 type submitRequest struct {
-	Prompt     string `json:"prompt"`
-	Repository string `json:"repository"`
-	Command    string `json:"command"`
-	Model      string `json:"model"`
+	Prompt         string `json:"prompt"`
+	Repository     string `json:"repository"`
+	Command        string `json:"command"`
+	Model          string `json:"model"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type commandDefinitionResponse struct {
@@ -236,7 +237,7 @@ func sleep(ctx context.Context, duration time.Duration) bool {
 }
 
 func (s *Server) maintainState(ctx context.Context) error {
-	_, reclaimErr := s.store.ReclaimExpiredLeases(ctx)
+	_, reclaimErr := s.store.QuarantineExpiredLeases(ctx)
 	_, pruneErr := s.store.PruneSupersededWorkers(ctx, s.store.now().UTC().Add(-workerAvailabilityWindow))
 	return errors.Join(reclaimErr, pruneErr)
 }
@@ -257,6 +258,7 @@ func (s *Server) routes() (http.Handler, error) {
 	mux.HandleFunc("GET /api/v1/catalog", s.catalog)
 	mux.HandleFunc("GET /api/v1/definitions", s.definitions)
 	mux.HandleFunc("POST /api/v1/jobs", s.authorizeSubmission(s.submit))
+	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", s.authorizeSubmission(s.cancelJob))
 	mux.HandleFunc("DELETE /api/v1/jobs/{id}", s.authorizeSubmission(s.deleteJob))
 	mux.HandleFunc("POST /api/v1/workers/poll", s.authorizeWorker(s.poll))
 	mux.HandleFunc("POST /api/v1/runs/{id}/heartbeat", s.authorizeWorker(s.heartbeat))
@@ -368,6 +370,10 @@ func (s *Server) submit(response http.ResponseWriter, request *http.Request) {
 		writeError(response, http.StatusBadRequest, errors.New("command is required"))
 		return
 	}
+	if err := validateIdempotencyKey(input.IdempotencyKey); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
 	command, err := config.LoadCommand(s.definitionPath, input.Command)
 	if err != nil {
 		writeError(response, http.StatusBadRequest, err)
@@ -379,17 +385,59 @@ func (s *Server) submit(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 	command.Model = input.Model
-	jobID, err := s.store.CreateJob(request.Context(), input.Prompt, input.Repository, input.Command, command)
+	jobID, created, err := s.store.CreateJobIdempotent(request.Context(), input.Prompt, input.Repository, input.Command, input.IdempotencyKey, command)
+	if errors.Is(err, ErrIdempotencyConflict) {
+		writeError(response, http.StatusConflict, err)
+		return
+	}
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(response, http.StatusCreated, map[string]string{"id": jobID})
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(response, status, map[string]string{"id": jobID})
+}
+
+func validateIdempotencyKey(key string) error {
+	if key == "" {
+		return nil
+	}
+	if len(key) > 200 {
+		return errors.New("idempotency key must be at most 200 characters")
+	}
+	for _, character := range key {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || strings.ContainsRune("._:-", character) {
+			continue
+		}
+		return errors.New("idempotency key may contain only letters, numbers, period, underscore, colon, and hyphen")
+	}
+	return nil
 }
 
 func (s *Server) deleteJob(response http.ResponseWriter, request *http.Request) {
 	err := s.store.DeleteJob(request.Context(), request.PathValue("id"))
 	if errors.Is(err, ErrJobActive) {
+		writeError(response, http.StatusConflict, err)
+		return
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(response, http.StatusNotFound, errors.New("job not found"))
+		return
+	}
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	response.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) cancelJob(response http.ResponseWriter, request *http.Request) {
+	err := s.store.CancelJob(request.Context(), request.PathValue("id"))
+	if errors.Is(err, ErrJobTerminal) {
 		writeError(response, http.StatusConflict, err)
 		return
 	}

@@ -67,6 +67,24 @@ For a direct run, Machinist maps the configured command name to a fixed executab
 
 Scripts are intentionally opaque. Their internal stages appear in logs, but Machinist does not invent child runs, graphs, checkpoints, or resumable stages. A killed script restarts from the beginning unless the script owns checkpointing.
 
+Managed callers can make a retry safe by supplying a stable key. An exact replay returns the
+original job; reusing the key for different work is rejected:
+
+```sh
+machinist submit --config ~/.machinist/worker.toml --command foreman \
+  --repo example --idempotency-key issue-42-foreman --prompt "Implement issue 42"
+```
+
+Cancel one queued or running managed job with:
+
+```sh
+machinist cancel JOB_ID --config ~/.machinist/worker.toml
+```
+
+A running worker observes the cancellation through its heartbeat and terminates the executor
+process group. If a lease expires unexpectedly, Machinist fails the run closed for manual
+reconciliation instead of dispatching the same work to another worker.
+
 ## Go deeper
 
 | Guide | What it covers |
