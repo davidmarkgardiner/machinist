@@ -208,9 +208,11 @@ func submitSelection(ctx context.Context, options *commandOptions, commandName, 
 	if err := client.Get(ctx, "/api/v1/catalog", &catalog); err != nil {
 		return fmt.Errorf("read control plane catalog: %w", err)
 	}
-	if !slices.Contains(catalog.Repositories, repository) {
+	configuredRepository, ok := normalizeCatalogRepository(catalog.Repositories, repository)
+	if !ok {
 		return fmt.Errorf("repository %q is not defined in the control plane; check the configured repository name and worker registration", repository)
 	}
+	repository = configuredRepository
 	if !slices.Contains(catalog.Commands, commandName) {
 		return fmt.Errorf("command %q is not defined in the control plane", commandName)
 	}
@@ -224,6 +226,17 @@ func submitSelection(ctx context.Context, options *commandOptions, commandName, 
 	}
 	fmt.Fprintln(options.stdout, result.ID)
 	return nil
+}
+
+func normalizeCatalogRepository(repositories []string, input string) (string, bool) {
+	if slices.Contains(repositories, input) {
+		return input, true
+	}
+	owner, name, found := strings.Cut(input, "/")
+	if !found || owner == "" || name == "" || strings.Contains(name, "/") || !slices.Contains(repositories, name) {
+		return "", false
+	}
+	return name, true
 }
 
 func newStartCommand(options *commandOptions) *cobra.Command {
