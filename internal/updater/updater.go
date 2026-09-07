@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	defaultAPIBase     = "https://api.github.com/repos/owainlewis/machinist"
-	defaultReleaseBase = "https://github.com/owainlewis/machinist/releases/download"
+	defaultAPIBase     = "https://api.github.com/repos/davidmarkgardiner/machinist"
+	defaultReleaseBase = "https://github.com/davidmarkgardiner/machinist/releases/download"
 	maxMetadataSize    = 1 << 20
 	maxChecksumsSize   = 1 << 20
 	maxArchiveSize     = 100 << 20
