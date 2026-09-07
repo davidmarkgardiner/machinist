@@ -409,6 +409,43 @@ func TestSubmitQueuesAgentWithConfiguredBearerToken(t *testing.T) {
 	}
 }
 
+func TestSubmitNormalizesConfiguredGitHubSlugToRepositoryName(t *testing.T) {
+	var gotRequest submitJobRequest
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/catalog":
+			writeTestJSON(response, map[string]any{
+				"commands": []string{"shepherd"}, "repositories": []string{"machinist-worker-smoke-test"},
+			})
+		case "/api/v1/jobs":
+			if err := json.NewDecoder(request.Body).Decode(&gotRequest); err != nil {
+				http.Error(response, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeTestJSON(response, map[string]string{"id": "job_shepherd"})
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	workerConfig := writeSubmitWorkerConfig(t, server.URL, "secret")
+
+	var stdout, stderr bytes.Buffer
+	exitCode := Execute(t.Context(), []string{
+		"submit",
+		"--command=shepherd",
+		"--prompt=review pull request 16",
+		"--repo=davidmarkgardiner/machinist-worker-smoke-test",
+		"--config=" + workerConfig,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if exitCode != 0 || stdout.String() != "job_shepherd\n" {
+		t.Fatalf("exit code = %d, stdout = %q, stderr = %q", exitCode, stdout.String(), stderr.String())
+	}
+	if gotRequest.Repository != "machinist-worker-smoke-test" {
+		t.Fatalf("repository = %q", gotRequest.Repository)
+	}
+}
+
 func TestCancelRequestsOneManagedJob(t *testing.T) {
 	var gotPath, gotAuthorization string
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
