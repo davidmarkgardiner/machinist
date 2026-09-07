@@ -14,6 +14,13 @@ import (
 	"testing"
 )
 
+func TestDefaultReleaseSourceUsesMaintainedFork(t *testing.T) {
+	if defaultAPIBase != "https://api.github.com/repos/davidmarkgardiner/machinist" ||
+		defaultReleaseBase != "https://github.com/davidmarkgardiner/machinist/releases/download" {
+		t.Fatalf("default release source = %q, %q", defaultAPIBase, defaultReleaseBase)
+	}
+}
+
 func TestUpdateInstallsLatestVerifiedRelease(t *testing.T) {
 	binary := []byte("new machinist")
 	archive := testArchive(t, binary)
