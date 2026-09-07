@@ -30,6 +30,7 @@ function App() {
   const [submitError, setSubmitError] = useState("");
   const [taskActionError, setTaskActionError] = useState("");
   const [deletingJob, setDeletingJob] = useState("");
+  const [cancellingJob, setCancellingJob] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
   const [filter, setFilter] = useState("all");
@@ -145,6 +146,27 @@ function App() {
     }
   }
 
+  async function cancelJob(job) {
+    if (!window.confirm(`Cancel task ${shortId(job.id)}? Its worker process will be stopped at the next heartbeat.`)) return;
+    setCancellingJob(job.id);
+    setTaskActionError("");
+    try {
+      const response = await fetch(`/api/v1/jobs/${encodeURIComponent(job.id)}/cancel`, {
+        method: "POST",
+        headers: { "X-Machinist-CSRF": status.csrf_token },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Cancellation failed (${response.status})`);
+      }
+      await statusLoader.current.refresh();
+    } catch (requestError) {
+      setTaskActionError(requestError.message);
+    } finally {
+      setCancellingJob("");
+    }
+  }
+
   return (
     <div className="app-shell min-h-screen bg-background text-foreground md:flex">
       <aside className="app-sidebar sticky top-0 z-20 flex shrink-0 items-center border-b border-border bg-sidebar px-3 py-2 md:h-screen md:w-56 md:flex-col md:items-stretch md:border-b-0 md:border-r md:px-4 md:py-5">
@@ -171,7 +193,7 @@ function App() {
       </aside>
 
       <main className="workshop min-w-0 flex-1">
-        {view === "task" ? <TaskDetail job={selectedJob} loaded={statusLoaded} error={statusError || taskActionError} deleting={deletingJob === route.jobID} onDelete={deleteJob} /> : view === "analytics" ? <Analytics jobs={status.jobs} loaded={statusLoaded} error={statusError} /> : view === "workers" ? <WorkersPage workers={status.workers} loaded={statusLoaded} error={statusError} /> : view === "triggers" ? <TriggersPage triggers={status.triggers || []} loaded={statusLoaded} error={statusError} /> : view === "commands" ? <CommandsPage /> : <div className="mx-auto max-w-[1500px] space-y-6 p-4 sm:p-6 lg:p-8">
+        {view === "task" ? <TaskDetail job={selectedJob} loaded={statusLoaded} error={statusError || taskActionError} deleting={deletingJob === route.jobID} cancelling={cancellingJob === route.jobID} onDelete={deleteJob} onCancel={cancelJob} /> : view === "analytics" ? <Analytics jobs={status.jobs} loaded={statusLoaded} error={statusError} /> : view === "workers" ? <WorkersPage workers={status.workers} loaded={statusLoaded} error={statusError} /> : view === "triggers" ? <TriggersPage triggers={status.triggers || []} loaded={statusLoaded} error={statusError} /> : view === "commands" ? <CommandsPage /> : <div className="mx-auto max-w-[1500px] space-y-6 p-4 sm:p-6 lg:p-8">
           <PageHeading title="Runs" description="Work in motion, from first cut to finished run.">
             <div className="flex items-center gap-2">
               <Button className="text-xs!" onClick={() => setComposerOpen(true)}><Plus className="size-4" />New run</Button>
@@ -211,18 +233,20 @@ function App() {
   );
 }
 
-function TaskDetail({ job, loaded, error, deleting, onDelete }) {
+function TaskDetail({ job, loaded, error, deleting, cancelling, onDelete, onCancel }) {
   if (!loaded && !error) return <div className="mx-auto max-w-[1100px] p-4 sm:p-6 lg:p-8"><p className="text-sm text-muted-foreground">Loading task…</p></div>;
   if (!job) return <div className="mx-auto max-w-[1100px] space-y-6 p-4 sm:p-6 lg:p-8"><Button asChild variant="ghost" size="sm"><a href="#/runs"><ArrowLeft className="size-4" />Back to runs</a></Button>{error && <div role="alert" className="rounded-md border border-danger/35 bg-danger/10 px-3 py-2 text-sm text-danger">{error}</div>}<div className="border-y border-border py-12 text-center"><h1 className="text-xl font-semibold">Task not found</h1><p className="mt-1 text-sm text-muted-foreground">It may have been deleted.</p></div></div>;
   const usage = tokenUsageSummary(job.runs);
   const totalDuration = taskDurationMillis(job.runs);
-  const terminal = job.state === "succeeded" || job.state === "failed";
+  const terminal = ["succeeded", "failed", "timed_out", "cancelled"].includes(job.state);
+  const active = job.state === "queued" || job.state === "running";
   return <div className="mx-auto max-w-[1100px] space-y-8 p-4 sm:p-6 lg:p-8">
     <header className="space-y-4">
       <Button asChild variant="ghost" size="sm" className="-ml-3"><a href="#/runs"><ArrowLeft className="size-4" />Back to runs</a></Button>
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h1 className="truncate text-xl font-semibold" title={jobDisplayTitle(job)}>{jobDisplayTitle(job)}</h1><State value={job.state} /></div><p className="mt-1 break-all font-mono text-xs text-muted-foreground">{githubIssueReference(job) || shortId(job.id)}{githubIssueReference(job) ? ` · ${shortId(job.id)}` : ""}</p><p className="mt-1 break-all font-mono text-xs text-muted-foreground">{job.id}</p></div>
-        <Button variant="outline" className="self-start border-danger/35 text-danger hover:bg-danger/10" disabled={!terminal || deleting} onClick={() => onDelete(job)} title={terminal ? "Delete this task and its stored run data" : "Active tasks cannot be deleted"}><Trash2 className="size-4" />{deleting ? "Deleting…" : "Delete task"}</Button>
+        {active && <Button variant="outline" className="self-start border-danger/35 text-danger hover:bg-danger/10" disabled={cancelling} onClick={() => onCancel(job)} title="Cancel this task and stop its worker process"><X className="size-4" />{cancelling ? "Cancelling…" : "Cancel task"}</Button>}
+        {terminal && <Button variant="outline" className="self-start border-danger/35 text-danger hover:bg-danger/10" disabled={deleting} onClick={() => onDelete(job)} title="Delete this task and its stored run data"><Trash2 className="size-4" />{deleting ? "Deleting…" : "Delete task"}</Button>}
       </div>
       {error && <div role="alert" className="rounded-md border border-danger/35 bg-danger/10 px-3 py-2 text-sm text-danger">{error}</div>}
     </header>

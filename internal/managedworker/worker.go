@@ -31,6 +31,7 @@ type Worker struct {
 }
 
 const heartbeatInterval = 10 * time.Second
+const heartbeatFailureLimit = 2
 
 func New(workerConfig config.Worker, stdout, stderr io.Writer) (*Worker, error) {
 	if strings.TrimSpace(workerConfig.Name) == "" {
@@ -95,28 +96,34 @@ func (w *Worker) executeWithHeartbeats(ctx context.Context, spec protocol.RunSpe
 	if execute == nil {
 		execute = w.execute
 	}
-	return withHeartbeats(ctx, w, spec, "", func() protocol.Completion { return execute(ctx, spec) })
+	return withHeartbeats(ctx, w, spec, "", func(runCtx context.Context) protocol.Completion { return execute(runCtx, spec) })
 }
 
 func (w *Worker) deliverWithHeartbeats(ctx context.Context, spec protocol.RunSpec, completion protocol.Completion) error {
 	if err := w.heartbeat(ctx, spec); err != nil {
-		fmt.Fprintf(w.stderr, "machinist: heartbeat run %s before completion: %v\n", spec.ID, err)
+		return fmt.Errorf("heartbeat run %s before completion: %w", spec.ID, err)
 	}
-	return withHeartbeats(ctx, w, spec, " during completion", func() error { return w.deliver(ctx, spec.ID, completion) })
+	return withHeartbeats(ctx, w, spec, " during completion", func(deliveryCtx context.Context) error {
+		return w.deliver(deliveryCtx, spec.ID, completion)
+	})
 }
 
 // withHeartbeats runs work in the background and keeps the run lease alive
-// until it returns. Cancellation does not abandon the work; the work observes
-// ctx itself and its result is always returned.
-func withHeartbeats[T any](ctx context.Context, w *Worker, spec protocol.RunSpec, phase string, work func() T) T {
+// until it returns. Two consecutive heartbeat failures cancel work before the
+// 30-second lease can expire; an explicit lease conflict cancels immediately.
+// The work must observe its derived context and return its terminal result.
+func withHeartbeats[T any](ctx context.Context, w *Worker, spec protocol.RunSpec, phase string, work func(context.Context) T) T {
 	ticks := w.heartbeatTicks
 	if ticks == nil {
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 		ticks = ticker.C
 	}
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
 	done := make(chan T, 1)
-	go func() { done <- work() }()
+	go func() { done <- work(workCtx) }()
+	consecutiveFailures := 0
 	for {
 		select {
 		case result := <-done:
@@ -124,8 +131,17 @@ func withHeartbeats[T any](ctx context.Context, w *Worker, spec protocol.RunSpec
 		case <-ticks:
 			if err := w.heartbeat(ctx, spec); err != nil {
 				fmt.Fprintf(w.stderr, "machinist: heartbeat run %s%s: %v\n", spec.ID, phase, err)
+				consecutiveFailures++
+				var responseErr *ResponseError
+				if (errors.As(err, &responseErr) && responseErr.Status == 409) || consecutiveFailures >= heartbeatFailureLimit {
+					fmt.Fprintf(w.stderr, "machinist: cancelling run %s%s after lease heartbeat failure\n", spec.ID, phase)
+					cancelWork()
+				}
+			} else {
+				consecutiveFailures = 0
 			}
 		case <-ctx.Done():
+			cancelWork()
 			return <-done
 		}
 	}

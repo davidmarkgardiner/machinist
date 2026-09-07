@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -67,6 +68,7 @@ func newRootCommand(options *commandOptions) *cobra.Command {
 	root.AddCommand(newInitCommand(options))
 	root.AddCommand(newRunCommand(options))
 	root.AddCommand(newSubmitCommand(options))
+	root.AddCommand(newCancelCommand(options))
 	root.AddCommand(newStartCommand(options))
 	root.AddCommand(newUpdateCommand(options))
 
@@ -85,6 +87,29 @@ func newRootCommand(options *commandOptions) *cobra.Command {
 		},
 	})
 	return root
+}
+
+func newCancelCommand(options *commandOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:   "cancel JOB_ID",
+		Short: "Cancel one queued or running managed job",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			worker, err := config.LoadWorker(options.configPath)
+			if err != nil {
+				return err
+			}
+			client, err := managedworker.NewClient(worker)
+			if err != nil {
+				return err
+			}
+			if err := client.Post(command.Context(), "/api/v1/jobs/"+url.PathEscape(args[0])+"/cancel", nil, nil); err != nil {
+				return fmt.Errorf("cancel job: %w", err)
+			}
+			fmt.Fprintln(options.stdout, args[0])
+			return nil
+		},
+	}
 }
 
 func newWorkerValidateCommand(options *commandOptions) *cobra.Command {
@@ -138,10 +163,11 @@ type submitCatalog struct {
 }
 
 type submitJobRequest struct {
-	Prompt     string `json:"prompt"`
-	Repository string `json:"repository"`
-	Command    string `json:"command"`
-	Model      string `json:"model,omitempty"`
+	Prompt         string `json:"prompt"`
+	Repository     string `json:"repository"`
+	Command        string `json:"command"`
+	Model          string `json:"model,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 type submitJobResponse struct {
@@ -149,26 +175,27 @@ type submitJobResponse struct {
 }
 
 func newSubmitCommand(options *commandOptions) *cobra.Command {
-	var commandName, prompt, model, repository string
+	var commandName, prompt, model, repository, idempotencyKey string
 	submit := &cobra.Command{
 		Use:   "submit",
 		Short: "Queue work for a managed Machinist Worker",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			return submitSelection(command.Context(), options, commandName, prompt, model, repository)
+			return submitSelection(command.Context(), options, commandName, prompt, model, repository, idempotencyKey)
 		},
 	}
 	submit.Flags().StringVar(&commandName, "command", "", "command name from the control plane")
 	submit.Flags().StringVar(&prompt, "prompt", "", "work request supplied to the command on standard input (required)")
 	submit.Flags().StringVar(&model, "model", "", "executor model or configured alias for this task")
 	submit.Flags().StringVar(&repository, "repo", "", "configured repository name (required)")
+	submit.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "stable key that makes retries return the original job")
 	_ = submit.MarkFlagRequired("command")
 	_ = submit.MarkFlagRequired("prompt")
 	_ = submit.MarkFlagRequired("repo")
 	return submit
 }
 
-func submitSelection(ctx context.Context, options *commandOptions, commandName, prompt, model, repository string) error {
+func submitSelection(ctx context.Context, options *commandOptions, commandName, prompt, model, repository, idempotencyKey string) error {
 	worker, err := config.LoadWorker(options.configPath)
 	if err != nil {
 		return err
@@ -188,7 +215,7 @@ func submitSelection(ctx context.Context, options *commandOptions, commandName, 
 		return fmt.Errorf("command %q is not defined in the control plane", commandName)
 	}
 	var result submitJobResponse
-	request := submitJobRequest{Prompt: prompt, Repository: repository, Command: commandName, Model: model}
+	request := submitJobRequest{Prompt: prompt, Repository: repository, Command: commandName, Model: model, IdempotencyKey: idempotencyKey}
 	if err := client.Post(ctx, "/api/v1/jobs", request, &result); err != nil {
 		return fmt.Errorf("submit job: %w", err)
 	}

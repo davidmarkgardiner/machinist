@@ -72,7 +72,7 @@ func TestOpenStoreReplacesLegacySchema(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 || version != 3 {
+	if count != 0 || version != 4 {
 		t.Fatalf("migrated database count=%d version=%d", count, version)
 	}
 }
@@ -83,7 +83,7 @@ func TestOpenStoreRejectsNewerSchemaWithoutDeletingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('preserved'); PRAGMA user_version=4;`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('preserved'); PRAGMA user_version=5;`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -133,8 +133,85 @@ PRAGMA user_version=2;`); err != nil {
 	if err := store.db.QueryRow(`SELECT name,fleet_release,release_state,accepting_work FROM workers WHERE instance_id='worker-a'`).Scan(&name, &release, &state, &accepting); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 || name != "Worker A" || release != "" || state != "" || accepting != 1 {
+	if version != 4 || name != "Worker A" || release != "" || state != "" || accepting != 1 {
 		t.Fatalf("migrated worker = version %d name %q release %q state %q accepting %d", version, name, release, state, accepting)
+	}
+}
+
+func TestOpenStoreUpgradesVersionThreeJobsForIdempotentSubmission(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "machinist.db")
+	store := openTestStore(t, path)
+	jobID, err := store.CreateJob(t.Context(), "preserved request", "machinist", "plan", testAgent("plan", "Plan request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP INDEX jobs_submission_key; ALTER TABLE jobs DROP COLUMN submission_key; PRAGMA user_version=3;`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var version, submissionColumns int
+	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name='submission_key'`).Scan(&submissionColumns); err != nil {
+		t.Fatal(err)
+	}
+	var preserved string
+	if err := store.db.QueryRow(`SELECT prompt FROM jobs WHERE id=?`, jobID).Scan(&preserved); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 || submissionColumns != 1 || preserved != "preserved request" {
+		t.Fatalf("migration version=%d columns=%d preserved=%q", version, submissionColumns, preserved)
+	}
+}
+
+func TestCreateJobIdempotentReturnsOriginalJobForExactRetry(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
+	command := testAgent("plan", "Plan request")
+	firstID, created, err := store.CreateJobIdempotent(t.Context(), "request", "machinist", "plan", "issue-13-plan", command)
+	if err != nil || !created {
+		t.Fatalf("first submission = %q, created %v, %v", firstID, created, err)
+	}
+	secondID, created, err := store.CreateJobIdempotent(t.Context(), "request", "machinist", "plan", "issue-13-plan", command)
+	if err != nil || created || secondID != firstID {
+		t.Fatalf("retry = %q, created %v, %v; want %q", secondID, created, err, firstID)
+	}
+	var jobs, runs int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM runs`).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 || runs != 1 {
+		t.Fatalf("persisted jobs=%d runs=%d, want one each", jobs, runs)
+	}
+}
+
+func TestCreateJobIdempotentRejectsDifferentRetry(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
+	command := testAgent("plan", "Plan request")
+	if _, _, err := store.CreateJobIdempotent(t.Context(), "request", "machinist", "plan", "issue-13-plan", command); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateJobIdempotent(t.Context(), "different request", "machinist", "plan", "issue-13-plan", command); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed retry error = %v, want idempotency conflict", err)
 	}
 }
 
@@ -286,7 +363,7 @@ func TestStoreConcurrentJobLimitLeavesAdditionalJobsQueued(t *testing.T) {
 	}
 }
 
-func TestStoreConcurrentJobLimitRedispatchesExpiredActiveJob(t *testing.T) {
+func TestStoreConcurrentJobLimitQuarantinesExpiredJobBeforeLeasingNext(t *testing.T) {
 	clock := newTestClock(time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC))
 	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
 	store.now = clock.Now
@@ -294,7 +371,8 @@ func TestStoreConcurrentJobLimitRedispatchesExpiredActiveJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateJob(t.Context(), "queued", "machinist", "review", testAgent("review", "Queued request")); err != nil {
+	queuedJob, err := store.CreateJob(t.Context(), "queued", "machinist", "review", testAgent("review", "Queued request"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	initial, err := store.poll(t.Context(), pollRequest("worker-a", []string{"codex"}, []string{"machinist"}), 1, config.FleetReleasePolicy{})
@@ -303,10 +381,11 @@ func TestStoreConcurrentJobLimitRedispatchesExpiredActiveJob(t *testing.T) {
 	}
 
 	clock.Advance(leaseDuration)
-	redispatched, err := store.poll(t.Context(), pollRequest("worker-b", []string{"codex"}, []string{"machinist"}), 1, config.FleetReleasePolicy{})
-	if err != nil || redispatched == nil || redispatched.ID != initial.ID || redispatched.LeaseToken == initial.LeaseToken {
-		t.Fatalf("redispatched lease = %#v, %v", redispatched, err)
+	next, err := store.poll(t.Context(), pollRequest("worker-b", []string{"codex"}, []string{"machinist"}), 1, config.FleetReleasePolicy{})
+	if err != nil || next == nil || next.JobID != queuedJob || next.ID == initial.ID {
+		t.Fatalf("next lease = %#v, %v", next, err)
 	}
+	assertQuarantinedRun(t, store, initial.ID, activeJob)
 }
 
 func TestConcurrentPollsRespectGlobalJobLimit(t *testing.T) {
@@ -351,7 +430,7 @@ func TestConcurrentPollsRespectGlobalJobLimit(t *testing.T) {
 	}
 }
 
-func TestStoreRenewsAndRedispatchesExpiredLease(t *testing.T) {
+func TestStoreRenewsAndQuarantinesExpiredLease(t *testing.T) {
 	clock := newTestClock(time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC))
 	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
 	store.now = clock.Now
@@ -406,11 +485,11 @@ func TestStoreRenewsAndRedispatchesExpiredLease(t *testing.T) {
 	if err != nil || incompatible != nil {
 		t.Fatalf("incompatible poll = %#v, %v", incompatible, err)
 	}
-	assertReclaimedRun(t, store, first.ID, jobID)
+	assertQuarantinedRun(t, store, first.ID, jobID)
 
 	redispatched, err := store.Poll(t.Context(), pollRequest("worker-b", []string{"codex"}, []string{"machinist"}))
-	if err != nil || redispatched == nil || redispatched.ID != first.ID || redispatched.LeaseToken == first.LeaseToken {
-		t.Fatalf("redispatched lease = %#v, %v", redispatched, err)
+	if err != nil || redispatched != nil {
+		t.Fatalf("quarantined run was redispatched = %#v, %v", redispatched, err)
 	}
 	if err := store.Complete(t.Context(), first.ID, staleCompletion); !errors.Is(err, ErrLeaseConflict) {
 		t.Fatalf("stale completion after redispatch error = %v", err)
@@ -420,12 +499,12 @@ func TestStoreRenewsAndRedispatchesExpiredLease(t *testing.T) {
 		t.Fatalf("stale output = %#v, %v", output, err)
 	}
 	snapshot, err := store.Snapshot(t.Context())
-	if err != nil || snapshot.Jobs[0].State != "running" || len(snapshot.Jobs[0].Runs) != 1 {
+	if err != nil || snapshot.Jobs[0].State != "failed" || len(snapshot.Jobs[0].Runs) != 1 {
 		t.Fatalf("stale completion changed job: %#v, %v", snapshot, err)
 	}
 }
 
-func TestConcurrentPollsReclaimExpiredRunOnce(t *testing.T) {
+func TestConcurrentPollsQuarantineExpiredRunWithoutRedispatch(t *testing.T) {
 	clock := newTestClock(time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC))
 	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
 	store.now = clock.Now
@@ -470,9 +549,10 @@ func TestConcurrentPollsReclaimExpiredRunOnce(t *testing.T) {
 			}
 		}
 	}
-	if leases != 1 {
-		t.Fatalf("reclaimed leases = %d, want 1", leases)
+	if leases != 0 {
+		t.Fatalf("leases = %d, want 0", leases)
 	}
+	assertQuarantinedRun(t, store, initial.ID, initial.JobID)
 }
 
 func TestStorePersistsCurrentWorkerRepositories(t *testing.T) {
@@ -562,7 +642,7 @@ func TestStoreRetainsLatestDisconnectedWorkerRegistration(t *testing.T) {
 	}
 }
 
-func TestStoreReclaimsExpiredLeaseWithoutWorkerPoll(t *testing.T) {
+func TestStoreQuarantinesExpiredLeaseWithoutWorkerPoll(t *testing.T) {
 	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
 	clock := newTestClock(time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC))
 	store.now = clock.Now
@@ -575,16 +655,76 @@ func TestStoreReclaimsExpiredLeaseWithoutWorkerPoll(t *testing.T) {
 		t.Fatalf("poll = %#v, %v", run, err)
 	}
 	clock.Advance(leaseDuration + time.Second)
-	reclaimed, err := store.ReclaimExpiredLeases(t.Context())
-	if err != nil || reclaimed != 1 {
-		t.Fatalf("reclaimed leases = %d, %v", reclaimed, err)
+	quarantined, err := store.QuarantineExpiredLeases(t.Context())
+	if err != nil || quarantined != 1 {
+		t.Fatalf("quarantined leases = %d, %v", quarantined, err)
 	}
 	snapshot, err := store.Snapshot(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot.Jobs) != 1 || snapshot.Jobs[0].ID != jobID || snapshot.Jobs[0].State != "running" || snapshot.Jobs[0].Runs[0].State != "queued" || snapshot.Jobs[0].Runs[0].WorkerName != "" || !snapshot.Jobs[0].Runs[0].StartedAt.IsZero() {
+	if len(snapshot.Jobs) != 1 || snapshot.Jobs[0].ID != jobID || snapshot.Jobs[0].State != "failed" || snapshot.Jobs[0].Runs[0].State != "failed" || snapshot.Jobs[0].Runs[0].WorkerName == "" || snapshot.Jobs[0].Runs[0].StartedAt.IsZero() || snapshot.Jobs[0].Runs[0].Error != expiredLeaseError {
 		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestStoreCancelsQueuedAndRunningJobs(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
+	queuedID, err := store.CreateJob(t.Context(), "queued", "machinist", "plan", testAgent("plan", "Plan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelJob(t.Context(), queuedID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelJob(t.Context(), queuedID); err != nil {
+		t.Fatalf("idempotent cancel = %v", err)
+	}
+
+	runningID, err := store.CreateJob(t.Context(), "running", "machinist", "plan", testAgent("plan", "Plan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Poll(t.Context(), pollRequest("worker-a", []string{"codex"}, []string{"machinist"}))
+	if err != nil || run == nil {
+		t.Fatalf("poll = %#v, %v", run, err)
+	}
+	if err := store.CancelJob(t.Context(), runningID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Heartbeat(t.Context(), run.ID, protocol.Heartbeat{InstanceID: "worker-a", LeaseToken: run.LeaseToken}); !errors.Is(err, ErrRunState) {
+		t.Fatalf("heartbeat after cancel = %v, want run-state conflict", err)
+	}
+
+	snapshot, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Jobs) != 2 {
+		t.Fatalf("jobs = %#v", snapshot.Jobs)
+	}
+	for _, job := range snapshot.Jobs {
+		if job.State != "cancelled" || len(job.Runs) != 1 || job.Runs[0].State != "cancelled" || job.Runs[0].ExitCode == nil || *job.Runs[0].ExitCode != 130 || job.Runs[0].Error != "cancelled by operator" {
+			t.Fatalf("cancelled job = %#v", job)
+		}
+	}
+}
+
+func TestStoreRejectsCancellingCompletedJob(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "machinist.db"))
+	jobID, err := store.CreateJob(t.Context(), "complete", "machinist", "plan", testAgent("plan", "Plan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.Poll(t.Context(), pollRequest("worker-a", []string{"codex"}, []string{"machinist"}))
+	if err != nil || run == nil {
+		t.Fatalf("poll = %#v, %v", run, err)
+	}
+	if err := store.Complete(t.Context(), run.ID, protocol.Completion{InstanceID: "worker-a", LeaseToken: run.LeaseToken, State: "succeeded", ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelJob(t.Context(), jobID); !errors.Is(err, ErrJobTerminal) {
+		t.Fatalf("cancel completed job = %v", err)
 	}
 }
 
@@ -1214,22 +1354,22 @@ func assertLeaseExpiry(t *testing.T, store *Store, runID string, want time.Time)
 	}
 }
 
-func assertReclaimedRun(t *testing.T, store *Store, runID, jobID string) {
+func assertQuarantinedRun(t *testing.T, store *Store, runID, jobID string) {
 	t.Helper()
-	var state, workerName string
+	var state, workerName, runError string
 	var worker, token, expiry, started any
-	if err := store.db.QueryRowContext(t.Context(), `SELECT state,worker_instance,worker_name,lease_token,lease_expires_at,started_at FROM runs WHERE id=?`, runID).Scan(&state, &worker, &workerName, &token, &expiry, &started); err != nil {
+	if err := store.db.QueryRowContext(t.Context(), `SELECT state,worker_instance,worker_name,lease_token,lease_expires_at,started_at,error FROM runs WHERE id=?`, runID).Scan(&state, &worker, &workerName, &token, &expiry, &started, &runError); err != nil {
 		t.Fatal(err)
 	}
-	if state != "queued" || worker != nil || workerName != "" || token != nil || expiry != nil || started != nil {
-		t.Fatalf("reclaimed run = state %q worker %v worker name %q token %v expiry %v started %v", state, worker, workerName, token, expiry, started)
+	if state != "failed" || worker != nil || workerName == "" || token != nil || expiry != nil || started == nil || runError != expiredLeaseError {
+		t.Fatalf("quarantined run = state %q worker %v worker name %q token %v expiry %v started %v error %q", state, worker, workerName, token, expiry, started, runError)
 	}
 	var jobState string
 	if err := store.db.QueryRowContext(t.Context(), `SELECT state FROM jobs WHERE id=?`, jobID).Scan(&jobState); err != nil {
 		t.Fatal(err)
 	}
-	if jobState != "running" {
-		t.Fatalf("job state = %q, want running", jobState)
+	if jobState != "failed" {
+		t.Fatalf("job state = %q, want failed", jobState)
 	}
 }
 
@@ -1290,8 +1430,8 @@ func testVersionOneUpgrade(t *testing.T, partial string) {
 	}
 	defer store.Close()
 	var version int
-	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
-		t.Fatalf("schema version = %d, %v, want 3", version, err)
+	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 4 {
+		t.Fatalf("schema version = %d, %v, want 4", version, err)
 	}
 	var columns int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name IN ('has_shepherd','schedule_name')`).Scan(&columns); err != nil || columns != 0 {
